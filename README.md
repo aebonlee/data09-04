@@ -19,6 +19,7 @@
 - [프로젝트 기획서 (Markdown)](docs/01_프로젝트_기획서.md)
 - [프로젝트 기획서 (Word, docx)](docs/01_프로젝트_기획서.docx)
 - [패들릿 제출 원문](docs/source/패들릿_제출_원문.md)
+- [DB 스크립트 (Supabase)](supabase/README.md) — 브라우저 저장 대신 DB 를 쓸 때. 수강생 본인 Supabase 프로젝트에 적용
 
 ## 제출 자료 (`docs/source/`)
 
