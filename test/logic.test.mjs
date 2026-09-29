@@ -325,6 +325,130 @@ test('추정 엑셀 시트 4개 (조건·계수·비교·잔차)', () => {
   assert.equal(sh[2].rows.length, 1 + 3 * 2 * SF.points.length);
 });
 
+console.log('계측 표 형식 (2026-09-29 오후 요청 1)');
+const NAMES = SF.points.map(p => p.name);
+const LONG = (() => { const pc = {}; NAMES.forEach(n => { pc[n] = SB.measRows[0].indexOf(n); }); return L.parseMeasured(SB.measRows.slice(1), { rpmCol: 0, orderCol: 1, pointCols: pc }); })();
+const sameAsLong = (m, pts) => LONG.rows.forEach(r => {
+  const t = m.rows.find(x => x.rpm === r.rpm && x.order === r.order);
+  assert.ok(t, `${r.rpm}rpm ${r.order}차 없음`);
+  (pts || NAMES).forEach(n => assert.equal(t.values[n], r.values[n]));
+});
+test('머리행 차수 읽기: 1차 · 지점1_차수2 · order 4 · 2x', () => {
+  assert.equal(L.headerOrder('1차'), 1); assert.equal(L.headerOrder('_차수2'), 2); assert.equal(L.headerOrder('order 4'), 4); assert.equal(L.headerOrder('2x'), 2); assert.equal(L.headerOrder('RPM'), null);
+});
+test('위치 배정: 차수 우선 / 지점 우선 (지점 2 × 차수 3)', () => {
+  const o = L.measLayoutMap(1, ['A', 'B'], [1, 2, 3], 'order').map(c => c.point + c.order);
+  const p = L.measLayoutMap(1, ['A', 'B'], [1, 2, 3], 'point').map(c => c.point + c.order);
+  assert.deepEqual(o, ['A1', 'B1', 'A2', 'B2', 'A3', 'B3']); assert.deepEqual(p, ['A1', 'A2', 'A3', 'B1', 'B2', 'B3']);
+});
+test('여러 지점 차수 우선 파일 = 긴 형식과 같은 값 (위치 배정)', () => {
+  const t = SB.meas.orderMajor;
+  const m = L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: L.measLayoutMap(1, NAMES, [1, 2, 4], 'order') }]);
+  assert.ok(m.ok); assert.equal(m.kind, 'order'); assert.deepEqual(m.orders, [1, 2, 4]); sameAsLong(m);
+});
+test('여러 지점 지점 우선 파일 = 긴 형식과 같은 값 (위치 배정)', () => {
+  const t = SB.meas.pointMajor;
+  sameAsLong(L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: L.measLayoutMap(1, NAMES, [1, 2, 4], 'point') }]));
+});
+test('배치를 잘못 고르면 값이 달라짐(배정이 실제로 쓰임)', () => {
+  const m = L.parseMeasTable([{ rows: SB.meas.pointMajor.slice(1), rpmCol: 0, colMap: L.measLayoutMap(1, NAMES, [1, 2, 4], 'order') }]);
+  assert.throws(() => sameAsLong(m));
+});
+test('머리행 이름으로 자동 배정: 두 배치 모두 같은 결과', () => {
+  [SB.meas.orderMajor, SB.meas.pointMajor].forEach(t => {
+    const cm = L.measMapByHeader(t[0], NAMES, 0);
+    assert.equal(cm.length, 9); sameAsLong(L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: cm }]));
+  });
+});
+test('한 지점 차수별 (RPM, 1차, 2차, 4차) — 이름 없는 머리행도 그 지점으로', () => {
+  const t = SB.meas.single, cm = L.measMapByHeader(t[0], [NAMES[0]], 0);
+  assert.deepEqual(cm.map(c => c.order), [1, 2, 4]); sameAsLong(L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: cm }]), [NAMES[0]]);
+});
+test('지점별 시트 3개를 합치면 긴 형식과 같은 값', () => {
+  const parts = SB.meas.sheets.map(sh => ({ rows: sh.rows.slice(1), rpmCol: 0, colMap: L.measMapByHeader(sh.rows[0], [sh.name], 0) }));
+  sameAsLong(L.parseMeasTable(parts));
+});
+test('overall 표: kind overall, 섞이면 오류, 중복 배정 오류', () => {
+  const t = SB.meas.multiOverall, m = L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: L.measMapByHeader(t[0], NAMES, 0) }]);
+  assert.equal(m.kind, 'overall'); assert.equal(m.rows.length, 12); assert.equal(m.rows[0].order, 'overall');
+  assert.ok(!L.parseMeasTable([{ rows: [[1, 2, 3]], rpmCol: 0, colMap: [{ col: 1, point: 'A', order: 1 }, { col: 2, point: 'A', order: 'overall' }] }]).ok);
+  assert.ok(!L.parseMeasTable([{ rows: [[1, 2, 3]], rpmCol: 0, colMap: [{ col: 1, point: 'A', order: 1 }, { col: 2, point: 'A', order: 1 }] }]).ok);
+});
+
+console.log('오차 기준 — 평균(최소제곱) / 최대(minimax) (2026-09-29 오후 확인 4)');
+test('minimax 상수: [0,1,5] → 2.5 (최대 오차 2.5, 최소제곱이면 2)', () => { const s = L.lawson([[1], [1], [1]], [0, 1, 5]); near(s.x[0], 2.5, 1e-9); near(s.maxErr, 2.5, 1e-9); });
+test('minimax 직선: (0,0)(1,1)(2,0) → y = 0.5, 최대 오차 0.5', () => { const s = L.lawson([[1, 0], [1, 1], [1, 2]], [0, 1, 0]); near(s.x[0], 0.5, 1e-9); near(s.x[1], 0, 1e-9); });
+test('minimax 직선: (0,1)(1,3)(2,5)(3,8) → 2/3 + 7/3·x (오차 +⅓,−⅓,+⅓ 번갈아)', () => {
+  const s = L.solveLinear([[1, 0], [1, 1], [1, 2], [1, 3]], [1, 3, 5, 8], 'max'); near(s.x[0], 2 / 3, 1e-9); near(s.x[1], 7 / 3, 1e-9); near(s.maxErr, 1 / 3, 1e-9);
+});
+const noisyLong = synth((k, r) => L.polyEval(TRUE_POLY[k], r), RPMS, [1, 2, 4], 0.03);
+test('차수별 오차 + 최대 기준: 노이즈 없으면 1e-9 복원, 노이즈 있으면 최대 오차가 평균 기준보다 작고 RMS 는 큼', () => {
+  const e0 = L.estimatePoly(SF, synth((k, r) => L.polyEval(TRUE_POLY[k], r), RPMS, [1, 2, 4], 0), { ...OPT, degree: 2, crit: 'max' });
+  e0.fits.forEach(ft => ft.coef.forEach((c, j) => near(c / TRUE_POLY[ft.order][j], 1, 1e-9)));
+  const mean = L.estimatePoly(SF, noisyLong, { ...OPT, degree: 2, crit: 'mean' }), max = L.estimatePoly(SF, noisyLong, { ...OPT, degree: 2, crit: 'max' });
+  [1, 2, 4].forEach(k => {
+    const s1 = mean.stats.find(g => g.key === k + '차'), s2 = max.stats.find(g => g.key === k + '차');
+    assert.ok(s2.maxAbs < s1.maxAbs * 0.999, `${k}차 최대 ${s2.maxAbs} vs ${s1.maxAbs}`);
+    assert.ok(s2.rms >= s1.rms * (1 - 1e-9), `${k}차 RMS ${s2.rms} vs ${s1.rms}`);
+  });
+});
+test('상대오차 기준도 노이즈 없으면 1e-9 복원', () => {
+  const e = L.estimatePoly(SF, synth((k, r) => L.polyEval(TRUE_POLY[k], r), RPMS, [1, 2, 4], 0), { ...OPT, degree: 2, errScale: 'rel', crit: 'max' });
+  e.fits.forEach(ft => ft.coef.forEach((c, j) => near(c / TRUE_POLY[ft.order][j], 1, 1e-9)));
+});
+
+console.log('overall 오차 최소화 (2026-09-29 오후 요청 2·3)');
+const TP1 = { 1: [50, 0.02], 2: [30, -0.004], 4: [5, 0.006] };
+function overallOf(forceFn, pts, noise) {
+  let seed = 11; const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const rows = RPMS.map(rpm => { const values = {}; pts.forEach(n => { const P = SF.points.find(x => x.name === n); let s = 0;
+    [1, 2, 4].forEach(k => { s += (L.interpolate(SF.freq, P.mag, k * rpm / 60, 'linear').value * forceFn(k, rpm)) ** 2; });
+    values[n] = Math.sqrt(s) * (1 + (noise ? (rnd() - 0.5) * 2 * noise : 0)); }); return { rpm, order: 'overall', values }; });
+  return { ok: true, kind: 'overall', points: pts, orders: [], rows };
+}
+const OV = { ...OPT, objective: 'overall', orders: [1, 2, 4] };
+test('scale 고정 + overall: g = √Σ(|H|·r_k)², 노이즈 없으면 기준 차수 크기 1e-9 복원 (평균·최대)', () => {
+  const ratio = { 1: 1, 2: 0.5, 4: 0.2 }, Fref = r => 40 + 30 * Math.sin(r / 400);
+  ['mean', 'max'].forEach(crit => {
+    const e = L.estimateScaleFixed(SF, overallOf((k, r) => ratio[k] * Fref(r), NAMES, 0), { ...OV, ratio, ref: 1, crit });
+    assert.ok(e.ok); e.rpms.forEach((r, i) => near(e.refForce[i] / Fref(r), 1, 1e-9));
+  });
+});
+test('scale 고정 + overall, 계측 지점 1개: F = M / g 로 정확히', () => {
+  const ratio = { 1: 1, 2: 0.5, 4: 0.2 };
+  const e = L.estimateScaleFixed(SF, overallOf((k, r) => ratio[k] * 100, [NAMES[1]], 0.05), { ...OV, ratio, ref: 1 });
+  assert.ok(e.stats[0].maxAbs < 1e-9, '지점 하나면 RPM 마다 오차 0');
+});
+test('다항식 + overall: 차수별 계수를 overall 만으로 복원 (지점 3개·1개, 평균·최대, 1e-7)', () => {
+  [NAMES, [NAMES[0]]].forEach(pts => ['mean', 'max'].forEach(crit => {
+    const e = L.estimatePoly(SF, overallOf((k, r) => L.polyEval(TP1[k], r), pts, 0), { ...OV, degree: 1, crit });
+    assert.ok(e.ok, e.errors && e.errors.join());
+    e.fits.forEach(ft => ft.coef.forEach((c, j) => near(c / TP1[ft.order][j], 1, 1e-7)));
+  }));
+});
+test('다항식 + overall, ±2% 노이즈: 최대 기준의 최대 오차 < 평균 기준, 평균 기준 가진력은 참값과 3% 이내', () => {
+  const m = overallOf((k, r) => L.polyEval(TP1[k], r), NAMES, 0.02);
+  const a = L.estimatePoly(SF, m, { ...OV, degree: 1, crit: 'mean' }), b = L.estimatePoly(SF, m, { ...OV, degree: 1, crit: 'max' });
+  assert.ok(b.stats[0].maxAbs < a.stats[0].maxAbs * 0.999, `${b.stats[0].maxAbs} vs ${a.stats[0].maxAbs}`);
+  a.fits.forEach(ft => [1000, 2000, 3000].forEach(r => assert.ok(Math.abs(L.polyEval(ft.coef, r) / L.polyEval(TP1[ft.order], r) - 1) < 0.03, `${ft.order}차 ${r}`)));
+});
+test('차수별 계측으로도 overall 오차 최소화 가능 (M = √Σ m_k²) — overall 표와 같은 결과', () => {
+  const ratio = { 1: 1, 2: 0.5, 4: 0.208333 };
+  const fromOrders = L.estimateScaleFixed(SF, LONG, { ...OV, ratio, ref: 1, antiRatio: 0.05 });
+  const t = SB.meas.multiOverall, ov = L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: L.measMapByHeader(t[0], NAMES, 0) }]);
+  const fromOverall = L.estimateScaleFixed(SF, ov, { ...OV, ratio, ref: 1, antiRatio: 0.05 });
+  fromOrders.refForce.forEach((F, i) => near(F / fromOverall.refForce[i], 1, 1e-5)); // overall 표는 유효숫자 6자리로 적힘
+});
+test('overall 값뿐인 계측을 차수별 오차로 맞추려 하면 안내', () => {
+  const e = L.estimatePoly(SF, overallOf(() => 1, NAMES, 0), { ...OPT, degree: 1 });
+  assert.ok(!e.ok); assert.match(e.errors[0], /overall 오차/);
+});
+test('예시 overall(한 지점) 파일을 1차 다항식으로: 관측 12개 ≥ 계수 6개라 풀리고 잔차가 작음', () => {
+  const t = SB.meas.singleOverall, m = L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: L.measMapByHeader(t[0], [NAMES[0]], 0) }]);
+  const e = L.estimatePoly(SF, m, { ...OV, degree: 1 });
+  assert.ok(e.ok, e.errors && e.errors.join()); assert.ok(e.stats[0].rmsDb < 1, 'RMS dB ' + e.stats[0].rmsDb);
+});
+
 console.log('Python 교차 확인');
 test('python/rpm_response.py 가 같은 값을 냄', () => {
   let py;
@@ -363,6 +487,35 @@ test('python scale factor + 기준 차수 가진력 하나 = 차수별 상수 �
   const run = extra => execFileSync('python3', [path.join(ROOT, 'python', 'rpm_response.py'), path.join(ROOT, 'samples', '예시데이터_FRF.csv'),
     '--point', '예시_운전석바닥_진동', '--orders', '1,2,4', '--rpm', '800', '3000', '200'].concat(extra), { encoding: 'utf8' });
   assert.equal(run(['--scales', '1,0.5,0.2', '--ref-order', '1', '--forces', '120']), run(['--forces', '120,60,24']));
+});
+
+test('python 계측 형식 5가지 + overall·최대 기준 추정이 웹 로직과 같은 값', () => {
+  try { execFileSync('python3', ['--version']); } catch { return; }
+  const F = Sample.FILE_MEAS_FORMS, smp = n => path.join(ROOT, 'samples', n + '.csv');
+  const py = args => execFileSync('python3', [path.join(ROOT, 'python', 'rpm_response.py'), path.join(ROOT, 'samples', '예시데이터_FRF.csv')].concat(args), { encoding: 'utf8' })
+    .trim().split(/\r?\n/).slice(1).map(l => l.split(',').map(Number));
+  const cases = [
+    { args: ['--point', NAMES.join(','), '--estimate', smp(F.orderMajor), '--meas-format', 'wide', '--layout', 'order', '--meas-orders', '1,2,4'], rows: SB.meas.orderMajor, map: h => L.measLayoutMap(1, NAMES, [1, 2, 4], 'order') },
+    { args: ['--point', NAMES.join(','), '--estimate', smp(F.pointMajor), '--meas-format', 'wide', '--layout', 'point', '--meas-orders', '1,2,4'], rows: SB.meas.pointMajor, map: h => L.measLayoutMap(1, NAMES, [1, 2, 4], 'point') },
+    { args: ['--point', NAMES.join(','), '--estimate', smp(F.multiOverall), '--meas-format', 'wide'], rows: SB.meas.multiOverall, map: h => L.measMapByHeader(h, NAMES, 0) },
+    { args: ['--point', NAMES[0], '--estimate', smp(F.singleOverall), '--meas-format', 'wide'], rows: SB.meas.singleOverall, map: h => L.measMapByHeader(h, [NAMES[0]], 0), pts: [NAMES[0]] },
+    { args: ['--point', NAMES.join(','), '--estimate', SB.meas.sheets.map(sh => smp(F.sheets + '_' + sh.name)).join(','), '--meas-format', 'files'], sheets: true }
+  ];
+  cases.forEach((c, ci) => {
+    const m = c.sheets ? L.parseMeasTable(SB.meas.sheets.map(sh => ({ rows: sh.rows.slice(1), rpmCol: 0, colMap: L.measMapByHeader(sh.rows[0], [sh.name], 0) })))
+      : L.parseMeasTable([{ rows: c.rows.slice(1), rpmCol: 0, colMap: c.map(c.rows[0]) }]);
+    [['mean', 1e-7], ['max', 1e-4]].forEach(([crit, tol]) => {
+      const js = L.estimatePoly(SF, m, { interp: 'linear', antiRatio: 0.05, degree: 1, objective: 'overall', orders: [1, 2, 4], crit });
+      const out = py(c.args.concat(['--orders', '1,2,4', '--degree', '1', '--objective', 'overall', '--crit', crit]));
+      js.fits.forEach((ft, i) => ft.coef.forEach((v, j) => assert.ok(Math.abs(out[i][j + 1] / v - 1) < tol, `경우 ${ci} ${crit} ${ft.order}차 c${j}: ${out[i][j + 1]} vs ${v}`)));
+    });
+    if (m.kind === 'order') {
+      const ratio = { 1: 1, 2: 0.5, 4: 0.2 };
+      const js = L.estimateScaleFixed(SF, m, { interp: 'linear', antiRatio: 0.05, ratio, ref: 1, crit: 'max', errScale: 'rel' });
+      const out = py(c.args.concat(['--orders', '1,2,4', '--scales', '1,0.5,0.2', '--ref-order', '1', '--crit', 'max', '--rel']));
+      js.rpms.forEach((r, i) => { near(out[i][0], r); assert.ok(Math.abs(out[i][1] / js.refForce[i] - 1) < 1e-6, `경우 ${ci} scale ${r}`); });
+    }
+  });
 });
 
 console.log(`\n${passed}개 통과${process.exitCode ? ' — 실패 있음' : ''}`);

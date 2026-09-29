@@ -60,11 +60,36 @@
         measRows.push(line);
       });
     }
+    // 2026-09-29 오후 — 같은 계측값을 수강생이 정의한 여러 형식으로도 적어 둡니다(불러오기 시연·테스트용)
+    var byKey = {};
+    measRows.slice(1).forEach(function (r) { byKey[r[0] + '|' + r[1]] = r.slice(2); });
+    var RPMS = [];
+    for (var q = 800; q <= 3000; q += 200) RPMS.push(q);
+    function val(rpm, k, pi) { return byKey[rpm + '|' + k][pi]; }
+    function ovl(rpm, pi) { var s = 0; ORDERS.forEach(function (k) { s += Math.pow(val(rpm, k, pi), 2); }); return sig(Math.sqrt(s)); }
+    var names = POINTS.map(function (p) { return p.name; });
+    var meas = {
+      // 한 지점, 차수별 열: RPM, 1차, 2차, …
+      single: [['RPM'].concat(ORDERS.map(function (k) { return k + '차'; }))].concat(RPMS.map(function (r) { return [r].concat(ORDERS.map(function (k) { return val(r, k, 0); })); })),
+      // 한 지점, overall 만: RPM, overall
+      singleOverall: [['RPM', 'overall']].concat(RPMS.map(function (r) { return [r, ovl(r, 0)]; })),
+      // 여러 지점, 차수 우선: 지점1_1차, 지점2_1차, …, 지점1_2차, …
+      orderMajor: [['RPM'].concat([].concat.apply([], ORDERS.map(function (k) { return names.map(function (n) { return n + '_' + k + '차'; }); })))]
+        .concat(RPMS.map(function (r) { return [r].concat([].concat.apply([], ORDERS.map(function (k) { return names.map(function (n, pi) { return val(r, k, pi); }); }))); })),
+      // 여러 지점, 지점 우선: 지점1_1차, 지점1_2차, …, 지점2_1차, …
+      pointMajor: [['RPM'].concat([].concat.apply([], names.map(function (n) { return ORDERS.map(function (k) { return n + '_' + k + '차'; }); })))]
+        .concat(RPMS.map(function (r) { return [r].concat([].concat.apply([], names.map(function (n, pi) { return ORDERS.map(function (k) { return val(r, k, pi); }); }))); })),
+      // 여러 지점, overall 만
+      multiOverall: [['RPM'].concat(names.map(function (n) { return n + '_overall'; }))].concat(RPMS.map(function (r) { return [r].concat(names.map(function (n, pi) { return ovl(r, pi); })); })),
+      // 지점별 시트: 시트 이름 = 응답점, 시트마다 RPM, 1차, 2차, …
+      sheets: names.map(function (n, pi) { return { name: n, rows: [['RPM'].concat(ORDERS.map(function (k) { return k + '차'; }))].concat(RPMS.map(function (r) { return [r].concat(ORDERS.map(function (k) { return val(r, k, pi); })); })) }; })
+    };
     var forceRows = [['RPM'].concat(ORDERS.map(function (k) { return k + '차 가진력(N)'; }))];
     for (var r2 = 800; r2 <= 3000; r2 += 200) forceRows.push([r2].concat(ORDERS.map(function (k) { return r6(trueForce(k, r2)); })));
     return {
       frfRows: frfRows,
       measRows: measRows,
+      meas: meas,
       forceRows: forceRows,
       units: POINTS.reduce(function (o, p) { o[p.name] = p.unit; return o; }, {}),
       settings: {
@@ -79,7 +104,11 @@
     };
   }
 
-  var api = { build: build, FILE_FRF: '예시데이터_FRF', FILE_MEAS: '예시데이터_계측응답', FILE_FORCE: '예시데이터_가진력표' };
+  var api = {
+    build: build, FILE_FRF: '예시데이터_FRF', FILE_MEAS: '예시데이터_계측응답', FILE_FORCE: '예시데이터_가진력표',
+    // 계측 형식별 예시 파일 (2026-09-29 오후)
+    FILE_MEAS_FORMS: { single: '예시데이터_계측_1지점_차수별', singleOverall: '예시데이터_계측_1지점_overall', orderMajor: '예시데이터_계측_다지점_차수우선', pointMajor: '예시데이터_계측_다지점_지점우선', multiOverall: '예시데이터_계측_다지점_overall', sheets: '예시데이터_계측_지점별시트' }
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.FRFSample = api;
 })(typeof window !== 'undefined' ? window : this);

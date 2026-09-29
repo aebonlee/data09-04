@@ -22,6 +22,19 @@ fs.writeFileSync(path.join(out, Sample.FILE_FRF + '.csv'), L.toCsv(s.frfRows));
 fs.writeFileSync(path.join(out, Sample.FILE_MEAS + '.csv'), L.toCsv(s.measRows));
 writeXlsx(Sample.FILE_MEAS, s.measRows);
 fs.writeFileSync(path.join(out, Sample.FILE_FORCE + '.csv'), L.toCsv(s.forceRows));
+// 계측 형식별 예시 (2026-09-29 오후): csv + xlsx, 지점별 시트는 xlsx 하나(+ 시트마다 csv — 파이썬용)
+const F = Sample.FILE_MEAS_FORMS;
+['single', 'singleOverall', 'orderMajor', 'pointMajor', 'multiOverall'].forEach(k => {
+  fs.writeFileSync(path.join(out, F[k] + '.csv'), L.toCsv(s.meas[k]));
+  writeXlsx(F[k], s.meas[k]);
+});
+{
+  const wb = XLSX.utils.book_new();
+  s.meas.sheets.forEach(sh => XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(sh.rows), L.sheetName(sh.name, {})));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(note), '안내');
+  fs.writeFileSync(path.join(out, F.sheets + '.xlsx'), XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' }));
+  s.meas.sheets.forEach(sh => fs.writeFileSync(path.join(out, F.sheets + '_' + sh.name + '.csv'), L.toCsv(sh.rows)));
+}
 
 // 검증: xlsx 를 앱과 같은 방식으로 다시 읽어 같은 FRF 표가 되는지
 const wb = XLSX.read(fs.readFileSync(path.join(out, Sample.FILE_FRF + '.xlsx')), { type: 'buffer' });

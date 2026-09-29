@@ -91,6 +91,17 @@ begin
   exception when check_violation then v_raised := true; end;
   perform public._assert(v_raised, 'scale factor 는 0 보다 커야 한다 (CHECK)');
   perform public._assert_eq((select scale from public.case_orders where order_no = 3), 0.2::numeric, 'scale factor 가 저장된다');
+
+  -- 2026-09-29 오후 — 비교 대상·오차 기준·오차 단위
+  update public.analysis_cases set est_objective = 'overall', est_crit = 'max', est_err_scale = 'rel' where title = '벡터';
+  v_raised := false;
+  begin insert into public.analysis_cases (title, est_crit) values ('X', 'median');
+  exception when check_violation then v_raised := true; end;
+  perform public._assert(v_raised, '오차 기준은 mean·max 만 (CHECK)');
+  v_raised := false;
+  begin insert into public.analysis_cases (title, est_objective) values ('X', 'db');
+  exception when check_violation then v_raised := true; end;
+  perform public._assert(v_raised, '비교 대상은 order·overall 만 (CHECK)');
   delete from public.analysis_cases where title = '벡터';   -- 아래 개수 검증에 섞이지 않게 (차수 행은 cascade)
 
   v_raised := false;

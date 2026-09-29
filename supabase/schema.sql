@@ -65,6 +65,18 @@ alter table public.analysis_cases add constraint analysis_cases_est_mode_check c
 alter table public.analysis_cases drop constraint if exists analysis_cases_poly_degree_check;
 alter table public.analysis_cases add constraint analysis_cases_poly_degree_check check (poly_degree between 0 and 5);
 
+-- 1-2. 2026-09-29 오후 — 추정 비교 대상·오차 기준·오차 단위. 계측 표 형식(가로·지점별 시트·긴 형식)과
+--      열 배정은 case_files.map(jsonb) 에 {format, rpmCol, wide:{…}, sheets:{…}} 로 들어가 칼럼이 필요 없다
+alter table public.analysis_cases add column if not exists est_objective text not null default 'order';  -- 차수별 / overall 오차
+alter table public.analysis_cases add column if not exists est_crit      text not null default 'mean';   -- 평균값 / 최대값
+alter table public.analysis_cases add column if not exists est_err_scale text not null default 'abs';    -- 절대 / 상대오차
+alter table public.analysis_cases drop constraint if exists analysis_cases_est_objective_check;
+alter table public.analysis_cases add constraint analysis_cases_est_objective_check check (est_objective in ('order', 'overall'));
+alter table public.analysis_cases drop constraint if exists analysis_cases_est_crit_check;
+alter table public.analysis_cases add constraint analysis_cases_est_crit_check check (est_crit in ('mean', 'max'));
+alter table public.analysis_cases drop constraint if exists analysis_cases_est_err_scale_check;
+alter table public.analysis_cases add constraint analysis_cases_est_err_scale_check check (est_err_scale in ('abs', 'rel'));
+
 -- 불러온 파일 — 한 건에 종류별로 하나 (frfFile · forceFile · measFile)
 --  sheets 는 엑셀 시트 내용을 그대로 담는다({시트명: [[셀…]…]}). 파일이 커서
 --  localStorage 에 못 담기던 것이 이 도구가 DB 를 가장 필요로 하는 이유다.

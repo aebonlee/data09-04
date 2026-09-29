@@ -31,6 +31,7 @@
 import argparse
 import csv
 import math
+import re
 import sys
 
 
@@ -155,49 +156,242 @@ def lstsq(A, b):
     return x
 
 
-def read_measured(path, points):
-    """계측 CSV(열 = RPM, 차수, 응답점…) → [(rpm, 차수, 응답점, |계측|)]"""
+def _read_csv(path):
     with open(path, encoding="utf-8-sig", newline="") as fp:
-        rows = list(csv.reader(fp))
-    head = [h.strip() for h in rows[0]]
-    cols = {p: head.index(p) for p in points if p in head}
+        return list(csv.reader(fp))
+
+
+def _num(v):
+    try:
+        return float(str(v).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def header_order(t):
+    """머리행에서 차수 읽기: 「1차」「2x」「order 4」「차수2」"""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(차|order|ord|x(?![a-z]))", t, re.I) or re.search(r"(?:차수|order)\s*[_\-\s]?(\d+(?:\.\d+)?)", t, re.I)
+    return float(m.group(1)) if m else None
+
+
+RE_OVERALL = re.compile(r"overall|전체|합성|(^|[^a-z])o\.?a\.?([^a-z]|$)", re.I)
+
+
+def meas_map(head, points, orders, layout):
+    """열 배정 [(열, 응답점, 차수|'overall')]. layout: order(차수 우선) / point(지점 우선) / header(머리행 이름)"""
+    if layout == "header":
+        out = []
+        for c, h in enumerate(head[1:], start=1):
+            h = h.strip()
+            hits = [p for p in points if p in h]
+            pt = max(hits, key=len) if hits else (points[0] if len(points) == 1 else None)
+            if pt is None:
+                continue
+            rest = h.replace(pt, "", 1)
+            k = "overall" if RE_OVERALL.search(rest) else header_order(rest)
+            if k is not None and (k == "overall" or orders is None or k in orders):
+                out.append((c, pt, k))
+        return out
+    P, K = len(points), len(orders)
     out = []
-    for r in rows[1:]:
-        try:
-            rpm, k = float(r[0]), float(r[1])
-        except (ValueError, IndexError):
-            continue
-        for p, c in cols.items():
-            try:
-                out.append((rpm, k, p, abs(float(r[c]))))
-            except (ValueError, IndexError):
-                pass
+    for j in range(P * K):
+        pi, ki = (j // K, j % K) if layout == "point" else (j % P, j // P)
+        out.append((1 + j, points[pi], orders[ki]))
     return out
 
 
-def estimate(frfs, meas, interp, anti_ratio, degree=None, ratio=None):
-    """계산 = |H_p(k·RPM/60)| × F_k(RPM) 와 계측의 제곱오차 합을 최소화.
+def read_measured(path, points, fmt="long", layout="header", orders=None):
+    """계측 CSV → [(rpm, 차수|'overall', 응답점, |계측|)] — 웹 도구 「계측 표 형식」과 같은 형식들
+      long : RPM, 차수, 응답점…          wide : RPM, 값 열들 (layout 으로 배정, 첫 열 = RPM)
+      files: path 가 쉼표로 여러 개 — points 순서대로 한 파일 = 한 지점 (RPM, 1차, 2차 …)"""
+    out = []
+    if fmt == "files":
+        for p, one in zip(points, path.split(",")):
+            out += read_measured(one, [p], "wide", layout, orders)
+        return out
+    rows = _read_csv(path)
+    head = [h.strip() for h in rows[0]]
+    if fmt == "long":
+        cols = {p: head.index(p) for p in points if p in head}
+        for r in rows[1:]:
+            rpm, k = (_num(r[0]), _num(r[1])) if len(r) > 1 else (None, None)
+            if rpm is None or k is None:
+                continue
+            for p, c in cols.items():
+                v = _num(r[c]) if c < len(r) else None
+                if v is not None:
+                    out.append((rpm, k, p, abs(v)))
+        return out
+    for r in rows[1:]:
+        rpm = _num(r[0]) if r else None
+        if rpm is None:
+            continue
+        for c, p, k in meas_map(head, points, orders, layout):
+            v = _num(r[c]) if c < len(r) else None
+            if v is not None:
+                out.append((rpm, k, p, abs(v)))
+    return out
+
+
+# ── 오차 기준: 평균(최소제곱) / 최대(minimax — Lawson 반복 재가중) ──────────
+def lawson(A, b, iters=400):
+    m = len(A)
+    w = [1.0 / m] * m
+    scale = max(abs(v) for v in b) or 1.0
+    best, best_max = None, float("inf")
+    for _ in range(iters):
+        sw = [math.sqrt(v) for v in w]
+        x = lstsq([[v * sw[i] for v in row] for i, row in enumerate(A)], [v * sw[i] for i, v in enumerate(b)])
+        if x is None:
+            break
+        r = [abs(sum(v * x[j] for j, v in enumerate(row)) - b[i]) for i, row in enumerate(A)]
+        mx = max(r)
+        if mx < best_max:
+            best, best_max = x, mx
+        if mx <= 1e-13 * scale:
+            break
+        tot = sum(wi * ri for wi, ri in zip(w, r))
+        if not tot > 0:
+            break
+        w = [wi * ri / tot for wi, ri in zip(w, r)]
+    return best
+
+
+def solve_linear(A, b, crit):
+    x = lstsq(A, b)
+    return x if x is None or crit != "max" else lawson(A, b)
+
+
+def levenberg(fun, beta, iters=300):
+    r, J = fun(beta)
+    cost = sum(v * v for v in r)
+    lam, n = 1e-3, len(beta)
+    it = 0
+    while it < iters and cost > 0:
+        it += 1
+        D = [math.sqrt(max(sum(row[j] ** 2 for row in J), 1e-300)) for j in range(n)]
+        A = J + [[math.sqrt(lam) * D[j] if c == j else 0.0 for c in range(n)] for j in range(n)]
+        d = lstsq(A, [-v for v in r] + [0.0] * n)
+        if d is None:
+            lam *= 10
+            if lam > 1e15:
+                break
+            continue
+        nb = [v + d[j] for j, v in enumerate(beta)]
+        nr, nJ = fun(nb)
+        nc = sum(v * v for v in nr)
+        if nc < cost:
+            rel = (cost - nc) / cost
+            beta, r, J, cost = nb, nr, nJ, nc
+            lam = max(lam / 3, 1e-15)
+            if rel < 1e-15:
+                break
+        else:
+            lam *= 4
+            if lam > 1e15:
+                break
+    return beta
+
+
+def estimate(frfs, meas, interp, anti_ratio, degree=None, ratio=None, objective="order", crit="mean", rel=False, orders=None):
+    """계산과 계측의 오차(평균 = 제곱 평균, 최대 = 최대 절대값)를 최소화. js/logic.js 의 estimateScaleFixed·estimatePoly 와 같은 계산.
+      objective order  : 계산 = |H_p(k·RPM/60)| × F_k(RPM)
+      objective overall: 계산 = √(Σ_k (|H_pk| × F_k)²)   (차수별 계측이면 계측 overall = √Σ m_k²)
     degree 가 있으면 차수별 다항식 계수, ratio 가 있으면 기준 차수의 RPM별 크기를 돌려줍니다."""
-    obs = []
-    for rpm, k, p, m in meas:
-        freq, mag = frfs[p]
-        h = interpolate(freq, mag, k * rpm / 60.0, interp)
-        if h is None or not h > 0 or h < anti_ratio * max(mag):
-            continue  # 범위 밖·반공진 부근은 맞춤에서 뺌 (웹 도구와 같음)
-        obs.append((rpm, k, h, m))
+    kinds = {k == "overall" for _, k, _, _ in meas}
+    if objective == "order" and True in kinds:
+        sys.exit("계측이 overall 값뿐이면 --objective overall 로 맞춰 주십시오.")
+    wt = (lambda m: 1.0 / m if m > 0 else 0.0) if rel else (lambda m: 1.0)
+    obs = []  # order: (rpm, k, h, m) / overall: (rpm, {k: h}, M)
+    if objective == "overall":
+        if True in kinds:
+            src = {(rpm, p): m for rpm, _, p, m in meas}
+            ks = sorted(orders)
+        else:
+            ks = sorted({k for _, k, _, _ in meas})
+            g = {}
+            for rpm, k, p, m in meas:
+                g.setdefault((rpm, p), {})[k] = m
+            src = {key: math.sqrt(sum(v * v for v in d.values())) for key, d in g.items() if all(k in d for k in ks)}
+        for (rpm, p), M in sorted(src.items()):
+            freq, mag = frfs[p]
+            hs = {k: interpolate(freq, mag, k * rpm / 60.0, interp) for k in ks}
+            if all(h is not None for h in hs.values()) and wt(M) > 0:
+                obs.append((rpm, hs, M))
+    else:
+        for rpm, k, p, m in meas:
+            freq, mag = frfs[p]
+            h = interpolate(freq, mag, k * rpm / 60.0, interp)
+            if h is None or not h > 0 or h < anti_ratio * max(mag):
+                continue  # 범위 밖·반공진 부근은 맞춤에서 뺌 (웹 도구와 같음)
+            obs.append((rpm, k, h, m))
+        ks = sorted({o[1] for o in obs})
     if ratio is not None:
-        acc = {}
-        for rpm, k, h, m in obs:
-            a = h * ratio[k]
-            n, d = acc.get(rpm, (0.0, 0.0))
-            acc[rpm] = (n + a * m, d + a * a)
-        return {rpm: n / d for rpm, (n, d) in sorted(acc.items())}
+        res = {}
+        for rpm in sorted({o[0] for o in obs}):
+            A, b = [], []
+            for o in obs:
+                if o[0] != rpm:
+                    continue
+                if objective == "overall":
+                    a, m = math.sqrt(sum((o[1][k] * ratio[k]) ** 2 for k in ks)), o[2]
+                else:
+                    a, m = o[2] * ratio[o[1]], o[3]
+                w = wt(m)
+                if w > 0:
+                    A.append([a * w])
+                    b.append(m * w)
+            x = solve_linear(A, b, crit) if A else None
+            res[rpm] = x[0] if x else None
+        return res
     xs = max(abs(o[0]) for o in obs) or 1.0
+    n = degree
     fits = {}
-    for k in sorted({o[1] for o in obs}):
-        use = [o for o in obs if o[1] == k]
-        A = [[h * (rpm / xs) ** j for j in range(degree + 1)] for rpm, _, h, _ in use]
-        beta = lstsq(A, [m for *_, m in use])
+    if objective == "overall":
+        base = [wt(o[2]) for o in obs]
+
+        def build(beta, w):
+            r, J = [], []
+            for i, (rpm, hs, M) in enumerate(obs):
+                x = rpm / xs
+                pk = [sum(beta[ki * (n + 1) + j] * x ** j for j in range(n + 1)) for ki in range(len(ks))]
+                c = math.sqrt(sum((hs[k] * pk[ki]) ** 2 for ki, k in enumerate(ks)))
+                r.append(w[i] * (c - M))
+                J.append([w[i] * (hs[k] ** 2 * pk[ki] / c if c > 0 else 0.0) * x ** j for ki, k in enumerate(ks) for j in range(n + 1)])
+            return r, J
+        num = den = 0.0
+        for i, (rpm, hs, M) in enumerate(obs):
+            g = math.sqrt(sum(h * h for h in hs.values())) * base[i]
+            num += g * M * base[i]
+            den += g * g
+        beta = [(num / den if den > 0 else 0.0) if q % (n + 1) == 0 else 0.0 for q in range(len(ks) * (n + 1))]
+        beta = levenberg(lambda bb: build(bb, base), beta, 500)
+        if crit == "max":
+            w = [1.0 / len(obs)] * len(obs)
+            best, best_max = beta, float("inf")
+            for _ in range(150):
+                sw = [math.sqrt(v) * base[i] for i, v in enumerate(w)]
+                beta = levenberg(lambda bb: build(bb, sw), beta, 60)
+                e = [abs(v) for v in build(beta, base)[0]]
+                mx = max(e)
+                if mx < best_max:
+                    best, best_max = beta[:], mx
+                tot = sum(wi * ei for wi, ei in zip(w, e))
+                if not tot > 0 or mx < 1e-13:
+                    break
+                w = [wi * ei / tot for wi, ei in zip(w, e)]
+            beta = best
+        mid = (obs[0][0] + obs[-1][0]) / 2
+        for ki, k in enumerate(ks):
+            coef = [b / xs ** j for j, b in enumerate(beta[ki * (n + 1):(ki + 1) * (n + 1)])]
+            if sum(c * mid ** j for j, c in enumerate(coef)) < 0:
+                coef = [-c for c in coef]  # overall 은 F_k 부호를 구분하지 못함 — 양수로 맞춤
+            fits[k] = coef
+        return fits
+    for k in ks:
+        use = [o for o in obs if o[1] == k and wt(o[3]) > 0]
+        A = [[h * (rpm / xs) ** j * wt(m) for j in range(n + 1)] for rpm, _, h, m in use]
+        beta = solve_linear(A, [m * wt(m) for *_, m in use], crit)
         if beta is None:
             sys.exit("%g차: 계수가 정해지지 않습니다. 다항식 차수를 낮춰 주십시오." % k)
         fits[k] = [b / xs ** j for j, b in enumerate(beta)]
@@ -218,6 +412,12 @@ def main():
     ap.add_argument("--estimate", metavar="계측CSV", help="가진력 추정 모드")
     ap.add_argument("--degree", type=int, help="추정: 차수별 다항식 차수 (scale 미고정)")
     ap.add_argument("--anti-ratio", type=float, default=0.05, help="추정: 반공진 경고 기준 (기본 0.05)")
+    ap.add_argument("--meas-format", default="long", choices=["long", "wide", "files"], help="계측 표 형식 (기본 long)")
+    ap.add_argument("--layout", default="header", choices=["header", "order", "point"], help="wide: 머리행 이름 / 차수 우선 / 지점 우선")
+    ap.add_argument("--meas-orders", help="wide·files 의 차수 목록(열 순서대로) 또는 overall")
+    ap.add_argument("--objective", default="order", choices=["order", "overall"], help="추정: 차수별 오차 / overall 오차")
+    ap.add_argument("--crit", default="mean", choices=["mean", "max"], help="추정: 오차 기준 평균(최소제곱) / 최대(minimax)")
+    ap.add_argument("--rel", action="store_true", help="추정: 상대오차(계측 대비)로 맞춤")
     a = ap.parse_args()
     orders = [float(x) for x in a.orders.split(",")] if a.orders else []
     ratio = None
@@ -228,16 +428,20 @@ def main():
     if a.estimate:
         points = a.point.split(",")
         frfs = {p: read_frf(a.frf_csv, p) for p in points}
-        meas = read_measured(a.estimate, points)
+        mo = None
+        if a.meas_orders:
+            mo = ["overall"] if a.meas_orders.strip() == "overall" else [float(x) for x in a.meas_orders.split(",")]
+        meas = read_measured(a.estimate, points, a.meas_format, a.layout, mo)
+        kw = dict(objective=a.objective, crit=a.crit, rel=a.rel, orders=orders)
         if ratio is not None:
-            res = estimate(frfs, meas, a.interp, a.anti_ratio, ratio=ratio)
+            res = estimate(frfs, meas, a.interp, a.anti_ratio, ratio=ratio, **kw)
             w.writerow(["RPM", "기준 %g차 추정 가진력" % a.ref_order])
             for rpm, F in res.items():
-                w.writerow(["%g" % rpm, repr(F)])
+                w.writerow(["%g" % rpm, "" if F is None else repr(F)])
         else:
             if a.degree is None:
                 sys.exit("--degree(다항식 차수) 또는 --scales/--ref-order 를 지정해 주십시오.")
-            res = estimate(frfs, meas, a.interp, a.anti_ratio, degree=a.degree)
+            res = estimate(frfs, meas, a.interp, a.anti_ratio, degree=a.degree, **kw)
             w.writerow(["차수"] + ["c%d" % j for j in range(a.degree + 1)])
             for k, coef in res.items():
                 w.writerow(["%g" % k] + [repr(c) for c in coef])
