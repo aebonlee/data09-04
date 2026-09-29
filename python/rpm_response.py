@@ -13,6 +13,20 @@
 입력 CSV: 첫 행이 머리행, 첫 열이 주파수(Hz).
 응답점 열은 「이름」(크기만) / 「이름 Mag」+「이름 Phase」 / 「이름 Real」+「이름 Imag」 중 하나로 찾습니다.
 결과는 CSV 로 표준출력에 씁니다(마지막 열이 overall).
+
+가진력 입력 (2026-09-29 추가, 웹 도구 2. 계산 조건과 같음)
+  --forces 120,60,25                      차수별 상수
+  --scales 1,0.5,0.2 --ref-order 1 --forces 120
+                                          scale factor: 기준 차수 하나만 넣으면 F_k = (s_k/s_기준) × F_기준
+  --force-vector 벡터.csv                 RPM 연동 벡터: 열 = RPM, 차수별 가진력(--orders 순서).
+                                          --scales 를 함께 주면 열 = RPM, 기준 차수 가진력 두 개만.
+
+가진력 추정 (2026-09-29 추가, 웹 도구 4. 가진력 추정과 같음 — 계산/계측 오차 최소화)
+  python3 python/rpm_response.py samples/예시데이터_FRF.csv --point 응답점1,응답점2 \
+      --estimate samples/예시데이터_계측응답.csv --degree 1          차수별 1차 다항식 계수
+  ... --estimate 계측.csv --orders 1,2,4 --scales 1,0.5,0.2 --ref-order 1
+                                          scale 고정: 기준 차수의 RPM별 크기
+  계측 CSV: 열 = RPM, 차수, 응답점 이름… (웹 도구의 예시 계측 표와 같은 형식)
 """
 import argparse
 import csv
@@ -83,27 +97,185 @@ def rpm_list(start, end, step):
     return out
 
 
+def scale_ratios(orders, scales, ref):
+    """F_k = (s_k / s_ref) × F_ref 의 비 s_k / s_ref"""
+    if len(scales) != len(orders):
+        sys.exit("차수와 scale factor 개수가 다릅니다.")
+    if ref not in orders:
+        sys.exit("기준 차수가 차수 목록에 없습니다.")
+    if any(s <= 0 for s in scales):
+        sys.exit("scale factor 는 0 보다 커야 합니다.")
+    sref = scales[orders.index(ref)]
+    return {k: s / sref for k, s in zip(orders, scales)}
+
+
+def read_force_vector(path, keys):
+    """RPM 연동 가진력 벡터 CSV → (rpm 오름차순, {차수: [값…]}). 숫자가 아닌 머리행은 건너뜁니다."""
+    with open(path, encoding="utf-8-sig", newline="") as fp:
+        recs = []
+        for r in csv.reader(fp):
+            try:
+                recs.append((float(r[0]), [float(r[j + 1]) for j in range(len(keys))]))
+            except (ValueError, IndexError):
+                continue
+    recs.sort()
+    return [r for r, _ in recs], {k: [v[j] for _, v in recs] for j, k in enumerate(keys)}
+
+
+# ── 최소제곱 (Householder QR) — js/logic.js 의 lstsq 와 같은 방법 ─────────────
+def lstsq(A, b):
+    m, n = len(A), len(A[0])
+    if m < n:
+        return None
+    R = [row[:] for row in A]
+    y = b[:]
+    for j in range(n):
+        norm = math.sqrt(sum(R[i][j] ** 2 for i in range(j, m)))
+        if norm == 0:
+            continue
+        alpha = -norm if R[j][j] > 0 else norm
+        v = [R[i][j] for i in range(j, m)]
+        v[0] -= alpha
+        vn = sum(t * t for t in v)
+        if vn == 0:
+            continue
+        for c in range(j, n):
+            s = 2 * sum(v[i - j] * R[i][c] for i in range(j, m)) / vn
+            for i in range(j, m):
+                R[i][c] -= s * v[i - j]
+        s = 2 * sum(v[i - j] * y[i] for i in range(j, m)) / vn
+        for i in range(j, m):
+            y[i] -= s * v[i - j]
+    maxd = max(abs(R[j][j]) for j in range(n))
+    if any(not abs(R[j][j]) > 1e-10 * maxd for j in range(n)):
+        return None
+    x = [0.0] * n
+    for j in range(n - 1, -1, -1):
+        x[j] = (y[j] - sum(R[j][c] * x[c] for c in range(j + 1, n))) / R[j][j]
+    return x
+
+
+def read_measured(path, points):
+    """계측 CSV(열 = RPM, 차수, 응답점…) → [(rpm, 차수, 응답점, |계측|)]"""
+    with open(path, encoding="utf-8-sig", newline="") as fp:
+        rows = list(csv.reader(fp))
+    head = [h.strip() for h in rows[0]]
+    cols = {p: head.index(p) for p in points if p in head}
+    out = []
+    for r in rows[1:]:
+        try:
+            rpm, k = float(r[0]), float(r[1])
+        except (ValueError, IndexError):
+            continue
+        for p, c in cols.items():
+            try:
+                out.append((rpm, k, p, abs(float(r[c]))))
+            except (ValueError, IndexError):
+                pass
+    return out
+
+
+def estimate(frfs, meas, interp, anti_ratio, degree=None, ratio=None):
+    """계산 = |H_p(k·RPM/60)| × F_k(RPM) 와 계측의 제곱오차 합을 최소화.
+    degree 가 있으면 차수별 다항식 계수, ratio 가 있으면 기준 차수의 RPM별 크기를 돌려줍니다."""
+    obs = []
+    for rpm, k, p, m in meas:
+        freq, mag = frfs[p]
+        h = interpolate(freq, mag, k * rpm / 60.0, interp)
+        if h is None or not h > 0 or h < anti_ratio * max(mag):
+            continue  # 범위 밖·반공진 부근은 맞춤에서 뺌 (웹 도구와 같음)
+        obs.append((rpm, k, h, m))
+    if ratio is not None:
+        acc = {}
+        for rpm, k, h, m in obs:
+            a = h * ratio[k]
+            n, d = acc.get(rpm, (0.0, 0.0))
+            acc[rpm] = (n + a * m, d + a * a)
+        return {rpm: n / d for rpm, (n, d) in sorted(acc.items())}
+    xs = max(abs(o[0]) for o in obs) or 1.0
+    fits = {}
+    for k in sorted({o[1] for o in obs}):
+        use = [o for o in obs if o[1] == k]
+        A = [[h * (rpm / xs) ** j for j in range(degree + 1)] for rpm, _, h, _ in use]
+        beta = lstsq(A, [m for *_, m in use])
+        if beta is None:
+            sys.exit("%g차: 계수가 정해지지 않습니다. 다항식 차수를 낮춰 주십시오." % k)
+        fits[k] = [b / xs ** j for j, b in enumerate(beta)]
+    return fits
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("frf_csv")
-    ap.add_argument("--point", required=True, help="응답점 이름")
-    ap.add_argument("--orders", required=True, help="차수 목록, 예: 1,2,4")
-    ap.add_argument("--forces", required=True, help="차수별 가진력, 예: 120,60,25")
-    ap.add_argument("--rpm", nargs=3, type=float, required=True, metavar=("시작", "끝", "간격"))
+    ap.add_argument("--point", required=True, help="응답점 이름 (추정은 쉼표로 여러 개)")
+    ap.add_argument("--orders", help="차수 목록, 예: 1,2,4")
+    ap.add_argument("--forces", help="차수별 가진력, 예: 120,60,25 (scale 사용 시 기준 차수 값 하나)")
+    ap.add_argument("--scales", help="차수별 scale factor, 예: 1,0.5,0.2")
+    ap.add_argument("--ref-order", type=float, help="scale factor 의 기준 차수")
+    ap.add_argument("--force-vector", help="RPM 연동 가진력 벡터 CSV")
+    ap.add_argument("--rpm", nargs=3, type=float, metavar=("시작", "끝", "간격"))
     ap.add_argument("--interp", default="linear", choices=["linear", "nearest", "loglog"])
+    ap.add_argument("--estimate", metavar="계측CSV", help="가진력 추정 모드")
+    ap.add_argument("--degree", type=int, help="추정: 차수별 다항식 차수 (scale 미고정)")
+    ap.add_argument("--anti-ratio", type=float, default=0.05, help="추정: 반공진 경고 기준 (기본 0.05)")
     a = ap.parse_args()
-    orders = [float(x) for x in a.orders.split(",")]
-    forces = [float(x) for x in a.forces.split(",")]
-    if len(orders) != len(forces):
-        sys.exit("차수와 가진력 개수가 다릅니다.")
-    freq, mag = read_frf(a.frf_csv, a.point)
+    orders = [float(x) for x in a.orders.split(",")] if a.orders else []
+    ratio = None
+    if a.scales:
+        ratio = scale_ratios(orders, [float(x) for x in a.scales.split(",")], a.ref_order)
     w = csv.writer(sys.stdout, lineterminator="\n")
+
+    if a.estimate:
+        points = a.point.split(",")
+        frfs = {p: read_frf(a.frf_csv, p) for p in points}
+        meas = read_measured(a.estimate, points)
+        if ratio is not None:
+            res = estimate(frfs, meas, a.interp, a.anti_ratio, ratio=ratio)
+            w.writerow(["RPM", "기준 %g차 추정 가진력" % a.ref_order])
+            for rpm, F in res.items():
+                w.writerow(["%g" % rpm, repr(F)])
+        else:
+            if a.degree is None:
+                sys.exit("--degree(다항식 차수) 또는 --scales/--ref-order 를 지정해 주십시오.")
+            res = estimate(frfs, meas, a.interp, a.anti_ratio, degree=a.degree)
+            w.writerow(["차수"] + ["c%d" % j for j in range(a.degree + 1)])
+            for k, coef in res.items():
+                w.writerow(["%g" % k] + [repr(c) for c in coef])
+        return
+
+    if not orders or not a.rpm:
+        sys.exit("--orders 와 --rpm 을 지정해 주십시오.")
+    if a.force_vector:
+        keys = [a.ref_order] if ratio is not None else orders
+        vrpm, cols = read_force_vector(a.force_vector, keys)
+        if ratio is not None:
+            cols = {k: [ratio[k] * v for v in cols[a.ref_order]] for k in orders}
+
+        def force(k, rpm):
+            return interpolate(vrpm, cols[k], rpm, "linear")  # RPM 사이 선형 보간, 범위 밖은 None
+    else:
+        if not a.forces:
+            sys.exit("--forces 또는 --force-vector 를 지정해 주십시오.")
+        forces = [float(x) for x in a.forces.split(",")]
+        if ratio is not None:
+            if len(forces) != 1:
+                sys.exit("scale factor 를 쓸 때는 --forces 에 기준 차수 값 하나만 넣습니다.")
+            forces = [ratio[k] * forces[0] for k in orders]
+        if len(orders) != len(forces):
+            sys.exit("차수와 가진력 개수가 다릅니다.")
+        const = dict(zip(orders, forces))
+
+        def force(k, rpm):
+            return const[k]
+
+    freq, mag = read_frf(a.frf_csv, a.point)
     w.writerow(["RPM"] + ["%g차 응답" % k for k in orders] + ["overall"])
     for rpm in rpm_list(*a.rpm):
         comps = []
-        for k, F in zip(orders, forces):
+        for k in orders:
             h = interpolate(freq, mag, k * rpm / 60.0, a.interp)
-            comps.append(None if h is None else h * F)
+            F = force(k, rpm)
+            comps.append(None if h is None or F is None else h * F)
         s = [c for c in comps if c is not None]
         overall = math.sqrt(sum(c * c for c in s)) if s else ""
         w.writerow(["%g" % rpm] + ["" if c is None else repr(c) for c in comps] + [repr(overall) if s else ""])

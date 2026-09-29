@@ -6,15 +6,24 @@
 
   // ── 상태 ─────────────────────────────────────────────────────
   function defaultSettings() {
-    return { rpmStart: '', rpmEnd: '', rpmStep: '', orders: [{ order: '', force: '' }], forceMode: 'const', forceUnit: 'N', interp: 'linear', antiRatio: 0.05 };
+    return {
+      rpmStart: '', rpmEnd: '', rpmStep: '', orders: [{ order: '', force: '', scale: '' }], forceMode: 'const', forceUnit: 'N', interp: 'linear', antiRatio: 0.05,
+      // 2026-09-29 추가 — scale factor · RPM 연동 벡터 · 추정 방식
+      scaleOn: false, refOrder: '', vectorRows: [], vectorStep: '', vectorPaste: '', estMode: 'each', polyDegree: 1
+    };
   }
   function emptyState() {
     return { sample: false, frfFile: null, frfMap: null, frf: null, frfWarnings: [], settings: defaultSettings(), forceFile: null, forceTable: null, measFile: null, measMap: null };
   }
   var state = Store.load() || emptyState();
   if (!state.settings) state.settings = defaultSettings();
-  var result = null, estimate = null;   // 계산 결과는 저장하지 않고 필요할 때 다시 계산
-  var ui = { point: 0, logY: false, detail: false };
+  (function fillDefaults() {   // 예전 버전에서 저장한 상태에 새 항목 채우기
+    var d = defaultSettings();
+    Object.keys(d).forEach(function (k) { if (state.settings[k] == null) state.settings[k] = d[k]; });
+  })();
+  var result = null, estimate = null, fit = null;   // 계산 결과는 저장하지 않고 필요할 때 다시 계산
+  var ui = { point: 0, logY: false, detail: false, fitPoint: 0 };
+  var MODE_SHORT = { const: '차수별 상수', vector: 'RPM 연동 벡터', table: 'RPM별 가진력 표 파일' };
 
   function save() {
     var ok = Store.save(state);
@@ -151,7 +160,7 @@
       el('h2', null, 'FRF 엑셀 선택'),
       el('p', { class: 'note' }, '단위 가진 FRF 결과 파일을 고르고, 아래에서 주파수 열과 응답점 열을 지정합니다. 실제 파일의 열 배치를 아직 모르기 때문에 열은 화면에서 직접 짝지어 주는 방식입니다.'),
       fileInput('FRF 파일', function (nf) {
-        state.frfFile = nf; state.sample = false; state.frf = null; result = null; estimate = null;
+        state.frfFile = nf; state.sample = false; state.frf = null; result = null; estimate = null; fit = null;
         var info = fileRowsInfo(nf);
         state.frfMap = L.guessMapping(info.headers);
         save(); render();
@@ -202,7 +211,7 @@
     var info = fileRowsInfo(state.frfFile);
     var r = L.buildFrf(info.data, state.frfMap);
     if (!r.ok) { state.frf = null; save(); render(); var eb = alertBox('error', 'FRF 표를 만들지 못했습니다', r.errors); eb.id = 'frfErrors'; main.appendChild(eb); eb.scrollIntoView({ block: 'nearest' }); return; }
-    state.frf = r.frf; state.frfWarnings = r.warnings; result = null; estimate = null;
+    state.frf = r.frf; state.frfWarnings = r.warnings; result = null; estimate = null; fit = null;
     save(); toast('FRF 표를 만들었습니다 — 응답점 ' + r.frf.points.length + '개');
     render();
   }
@@ -238,28 +247,52 @@
     var interpSel = el('select', { name: 'interp', onchange: function () { st.interp = this.value; save(); } },
       Object.keys(L.INTERP).map(function (k) { return el('option', { value: k, selected: k === st.interp }, L.INTERP[k]); }));
     var modeRow = el('div', { class: 'radio-row', role: 'radiogroup', 'aria-label': '가진력 입력 방식' },
-      [['const', '차수별 상수'], ['table', 'RPM별 가진력 표(엑셀·CSV)']].map(function (o) {
+      [['const', '차수별 상수'], ['vector', 'RPM 연동 벡터(화면에 입력·붙여넣기)'], ['table', 'RPM별 가진력 표 파일(엑셀·CSV)']].map(function (o) {
         return el('label', null, el('input', { type: 'radio', name: 'forceMode', value: o[0], checked: st.forceMode === o[0], onchange: function () { st.forceMode = o[0]; save(); render(); } }), o[1]);
       }));
-    var isConst = st.forceMode === 'const';
+    var isConst = st.forceMode === 'const', scaleOn = !!st.scaleOn;
+    var sc = scaleOn ? currentScale() : null;
+    var refNum = L.toNumber(st.refOrder);
+    var refRow = scaleOn ? st.orders.filter(function (o) { return L.toNumber(o.order) === refNum; })[0] : null;
     var orderRows = st.orders.map(function (o, i) {
+      var k = L.toNumber(o.order), isRef = scaleOn && k === refNum && !isNaN(k);
+      var forceCell = null;
+      if (isConst) {
+        if (!scaleOn || isRef) {
+          forceCell = el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', name: 'force', value: o.force === '' || o.force == null ? '' : String(o.force), 'aria-label': (i + 1) + '번째 가진력', oninput: function () { o.force = this.value; save(); }, onchange: scaleOn ? function () { render(); } : null }));
+        } else {
+          var Fr = refRow ? L.toNumber(refRow.force) : NaN;
+          var v = sc && sc.ok && !isNaN(Fr) && sc.ratio[k] != null ? L.fmt(sc.ratio[k] * Fr) : '-';
+          forceCell = el('td', { class: 'computed', title: '기준 차수 가진력 × (이 차수 scale ÷ 기준 차수 scale)' }, v + ' (계산)');
+        }
+      }
       return el('tr', null,
-        el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', name: 'order', value: o.order === '' ? '' : String(o.order), 'aria-label': (i + 1) + '번째 차수', oninput: function () { o.order = this.value; save(); } })),
-        isConst ? el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', name: 'force', value: o.force === '' || o.force == null ? '' : String(o.force), 'aria-label': (i + 1) + '번째 가진력', oninput: function () { o.force = this.value; save(); } })) : null,
-        el('td', null, el('button', { type: 'button', class: 'btn btn-small btn-danger', onclick: function () { st.orders.splice(i, 1); if (!st.orders.length) st.orders.push({ order: '', force: '' }); save(); render(); } }, '빼기')));
+        el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', name: 'order', value: o.order === '' ? '' : String(o.order), 'aria-label': (i + 1) + '번째 차수', oninput: function () { o.order = this.value; save(); }, onchange: scaleOn ? function () { render(); } : null })),
+        scaleOn ? el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', min: 0, name: 'scale', value: o.scale == null ? '' : String(o.scale), 'aria-label': (i + 1) + '번째 scale factor', oninput: function () { o.scale = this.value; save(); }, onchange: function () { render(); } })) : null,
+        scaleOn ? el('td', { class: 'center' }, el('input', { type: 'radio', name: 'refOrder', 'aria-label': (i + 1) + '번째 차수를 기준으로', checked: isRef, onchange: function () { st.refOrder = o.order; save(); render(); } })) : null,
+        forceCell,
+        el('td', null, el('button', { type: 'button', class: 'btn btn-small btn-danger', onclick: function () { st.orders.splice(i, 1); if (!st.orders.length) st.orders.push({ order: '', force: '', scale: '' }); save(); render(); } }, '빼기')));
     });
+    var scaleErr = scaleOn && sc && !sc.ok && validOrderNumbers().length ? alertBox('warn', 'scale factor 확인', sc.errors) : null;
     wrap.appendChild(el('section', { class: 'card' },
       el('h2', null, '차수와 가진력'),
       el('p', { class: 'note' }, '차수는 회전 차수로 보고 가진 주파수 = 차수 × RPM / 60 (Hz) 로 계산합니다(가정 — 기획서 10장 확인 사항). 0.5차 같은 소수 차수도 넣을 수 있습니다.'),
       modeRow,
+      el('label', { class: 'radio-row', style: 'margin-top:10px' }, el('input', { type: 'checkbox', name: 'scaleOn', checked: scaleOn, onchange: function () {
+        st.scaleOn = this.checked;
+        if (st.scaleOn && isNaN(L.toNumber(st.refOrder))) { var first = validOrderNumbers()[0]; if (first != null) st.refOrder = first; }
+        save(); render();
+      } }), '차수별 scale factor 사용 — 기준 차수 하나만 입력하면 나머지 차수는 F_k = (s_k ÷ s_기준) × F_기준 으로 계산'),
       el('div', { class: 'form-grid', style: 'margin-top:12px' },
         field('가진력 단위', el('input', { name: 'forceUnit', value: st.forceUnit || '', oninput: function () { st.forceUnit = this.value; save(); } }), '표시·엑셀 기록용'),
         field('FRF 보간 방식', interpSel, '가진 주파수가 해석 주파수 사이에 있을 때')),
-      el('div', { class: 'table-wrap', style: 'margin-top:14px' }, el('table', { class: 'grid map' },
-        el('thead', null, el('tr', null, el('th', null, '차수'), isConst ? el('th', null, '가진력' + (st.forceUnit ? ' (' + st.forceUnit + ')' : '')) : null, el('th', null, ''))),
+      el('div', { class: 'table-wrap', style: 'margin-top:14px' }, el('table', { class: 'grid map', id: 'orderTable' },
+        el('thead', null, el('tr', null, el('th', null, '차수'), scaleOn ? el('th', null, 'scale factor') : null, scaleOn ? el('th', null, '기준') : null,
+          isConst ? el('th', null, '가진력' + (st.forceUnit ? ' (' + st.forceUnit + ')' : '') + (scaleOn ? ' — 기준 차수만 입력' : '')) : null, el('th', null, ''))),
         el('tbody', null, orderRows))),
-      el('div', { class: 'btn-row', style: 'margin-top:10px' }, el('button', { type: 'button', class: 'btn btn-small', onclick: function () { st.orders.push({ order: '', force: '' }); save(); render(); } }, '차수 추가')),
-      isConst ? null : forceTableBlock()));
+      scaleErr,
+      el('div', { class: 'btn-row', style: 'margin-top:10px' }, el('button', { type: 'button', class: 'btn btn-small', onclick: function () { st.orders.push({ order: '', force: '', scale: '' }); save(); render(); } }, '차수 추가')),
+      st.forceMode === 'vector' ? vectorBlock() : st.forceMode === 'table' ? forceTableBlock() : null));
 
     wrap.appendChild(el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn btn-primary', id: 'calcBtn', onclick: runCalc }, 'RPM별 응답 계산')));
     return wrap;
@@ -267,7 +300,7 @@
   function forceTableBlock() {
     var ff = state.forceFile, st = state.settings;
     var box = el('div', { style: 'margin-top:18px' }, el('h3', null, 'RPM별 가진력 표'),
-      el('p', { class: 'note' }, '한 행 = RPM 하나, 차수마다 가진력 열 하나인 표를 불러옵니다(가정 형식). 표의 RPM 사이는 선형 보간하고, 표 범위 밖 RPM 은 계산하지 않습니다.'));
+      el('p', { class: 'note' }, '한 행 = RPM 하나, 차수마다 가진력 열 하나인 표를 불러옵니다(가정 형식). 표의 RPM 사이는 선형 보간하고, 표 범위 밖 RPM 은 계산하지 않습니다.' + (st.scaleOn ? ' scale factor 를 쓰므로 기준 차수 열 하나만 지정하면 됩니다.' : '')));
     if (ff && ff.source === 'estimate') {
       box.appendChild(el('div', { class: 'alert info' }, '지금 가진력 표는 「4. 가진력 추정」의 종합 추정값에서 왔습니다 (RPM ' + L.fmt(state.forceTable.rpm[0]) + '~' + L.fmt(state.forceTable.rpm[state.forceTable.rpm.length - 1]) + ', 차수 ' + Object.keys(state.forceTable.byOrder).join(', ') + '). 다른 파일을 고르면 바뀝니다.'));
     }
@@ -280,7 +313,7 @@
     var info = fileRowsInfo(ff);
     var rpmSel = colSelect('forceRpmCol', info.headers, ff.map.rpmCol);
     rpmSel.addEventListener('change', function () { ff.map.rpmCol = +this.value; save(); });
-    var ords = validOrderNumbers();
+    var ords = forceKeys();
     var rows = ords.map(function (k) {
       var cur = (ff.map.orderCols.filter(function (c) { return +c.order === k; })[0] || {}).col;
       var sel = colSelect('forceCol', info.headers, cur == null ? -1 : cur, true);
@@ -296,6 +329,63 @@
       : el('p', { class: 'note' }, '위 차수 칸에 차수를 먼저 입력하면 차수별 열을 고를 수 있습니다.'));
     return box;
   }
+  // scale factor 를 쓰면 기준 차수 하나, 아니면 모든 차수의 가진력을 입력받습니다
+  function forceKeys() {
+    var nums = validOrderNumbers();
+    if (!state.settings.scaleOn) return nums;
+    var r = L.toNumber(state.settings.refOrder);
+    return nums.indexOf(r) >= 0 ? [r] : [];
+  }
+  function currentScale() { return L.scaleRatios(state.settings.orders, validOrderNumbers(), state.settings.refOrder); }
+
+  // RPM 연동 가진력 벡터 — 화면 표에 직접 넣거나 엑셀에서 복사해 붙여넣기 (2026-09-29 요청 1)
+  function vectorBlock() {
+    var st = state.settings, keys = forceKeys();
+    var box = el('div', { style: 'margin-top:18px', id: 'vectorBlock' }, el('h3', null, 'RPM 연동 가진력 벡터'),
+      el('p', { class: 'note' }, st.scaleOn
+        ? '기준 차수(' + (keys[0] == null ? '미지정' : keys[0] + '차') + ')의 RPM별 가진력만 넣어 주십시오. 나머지 차수는 scale factor 비율로 계산합니다. RPM 사이는 선형 보간하고, 표 범위 밖 RPM 은 계산하지 않습니다.'
+        : '모든 차수의 RPM별 가진력을 넣어 주십시오. RPM 사이는 선형 보간하고, 표 범위 밖 RPM 은 계산하지 않습니다.'));
+    if (!keys.length) { box.appendChild(el('p', { class: 'note' }, st.scaleOn ? '위 표에서 기준 차수를 골라 주십시오.' : '위 차수 칸에 차수를 먼저 입력해 주십시오.')); return box; }
+    var rows = st.vectorRows.map(function (r, i) {
+      if (!r.v) r.v = {};
+      return el('tr', null,
+        el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', name: 'vrpm', value: r.rpm == null ? '' : String(r.rpm), 'aria-label': (i + 1) + '번째 RPM', oninput: function () { r.rpm = this.value; save(); } })),
+        keys.map(function (k) {
+          return el('td', null, el('input', { class: 'cell-input', type: 'number', step: 'any', name: 'vval', value: r.v[k] == null ? '' : String(r.v[k]), 'aria-label': (i + 1) + '번째 줄 ' + k + '차 가진력', oninput: function () { r.v[k] = this.value; save(); } }));
+        }),
+        el('td', null, el('button', { type: 'button', class: 'btn btn-small btn-danger', onclick: function () { st.vectorRows.splice(i, 1); save(); render(); } }, '빼기')));
+    });
+    var stepIn = el('input', { type: 'number', step: 'any', name: 'vectorStep', value: st.vectorStep === '' || st.vectorStep == null ? '' : String(st.vectorStep), placeholder: 'RPM 간격', oninput: function () { st.vectorStep = this.value; save(); } });
+    var paste = el('textarea', { name: 'vectorPaste', rows: 5, placeholder: 'RPM\t' + keys.map(function (k) { return k + '차'; }).join('\t') + '\n800\t…', oninput: function () { st.vectorPaste = this.value; save(); } });
+    paste.value = st.vectorPaste || '';
+    box.appendChild(el('div', { class: 'table-wrap tall', style: 'margin-top:10px' }, el('table', { class: 'grid map', id: 'vectorTable' },
+      el('thead', null, el('tr', null, el('th', null, 'RPM'), keys.map(function (k) { return el('th', null, k + '차 가진력' + (st.forceUnit ? ' (' + st.forceUnit + ')' : '') + (st.scaleOn ? ' — 기준' : '')); }), el('th', null, ''))),
+      el('tbody', null, rows.length ? rows : el('tr', null, el('td', { colspan: String(keys.length + 2), class: 'text' }, '아직 입력한 줄이 없습니다. 아래 「RPM 범위로 줄 만들기」나 붙여넣기로 시작해 주십시오.'))))));
+    box.appendChild(el('div', { class: 'btn-row', style: 'margin-top:10px' },
+      el('button', { type: 'button', class: 'btn btn-small', onclick: function () { st.vectorRows.push({ rpm: '', v: {} }); save(); render(); } }, '줄 추가'),
+      el('button', { type: 'button', class: 'btn btn-small btn-danger', onclick: function () { st.vectorRows = []; save(); render(); } }, '모두 비우기')));
+    box.appendChild(el('div', { class: 'form-grid', style: 'margin-top:12px' },
+      field('RPM 간격(벡터)', stepIn, '위 RPM 시작·끝 사이를 이 간격으로 줄을 만듭니다. 이미 넣은 값은 남깁니다.'),
+      el('div', { class: 'field' }, el('span', null, '\u00a0'), el('button', { type: 'button', class: 'btn', id: 'vectorFillBtn', onclick: function () {
+        var stp = L.toNumber(st.vectorStep) > 0 ? st.vectorStep : st.rpmStep;
+        var rl = L.rpmList(st.rpmStart, st.rpmEnd, stp);
+        if (!rl.ok) { toast(rl.errors[0], true); return; }
+        var old = {};
+        st.vectorRows.forEach(function (r) { var k = L.toNumber(r.rpm); if (!isNaN(k)) old[k] = r; });
+        st.vectorRows = rl.list.map(function (rpm) { return old[rpm] || { rpm: rpm, v: {} }; });
+        save(); render();
+      } }, 'RPM 범위로 줄 만들기'))));
+    box.appendChild(el('div', { style: 'margin-top:12px' },
+      field('엑셀에서 복사해 붙여넣기', paste, '열 순서: RPM, ' + keys.map(function (k) { return k + '차'; }).join(', ') + '. 탭·쉼표·공백 구분, 머리행은 건너뜁니다. 붙여넣으면 위 표를 바꿉니다.'),
+      el('div', { class: 'btn-row', style: 'margin-top:8px' }, el('button', { type: 'button', class: 'btn btn-small', id: 'vectorPasteBtn', onclick: function () {
+        var lines = L.splitPasted(st.vectorPaste);
+        if (!lines.length) { toast('붙여넣은 숫자 줄이 없습니다.', true); return; }
+        st.vectorRows = lines.map(function (c) { var v = {}; keys.forEach(function (k, j) { v[k] = c[j + 1] == null ? '' : c[j + 1]; }); return { rpm: c[0], v: v }; });
+        save(); render(); toast(lines.length + '줄을 넣었습니다.');
+      } }, '붙여넣은 값으로 표 채우기'))));
+    return box;
+  }
+
   function guessForceMap(headers) {
     var rpmCol = 0;
     headers.forEach(function (h, i) { if (/rpm|회전/i.test(String(h)) && rpmCol === 0) rpmCol = i; });
@@ -318,23 +408,44 @@
     if (!state.frf) errs.push('FRF 표가 없습니다. 1단계에서 FRF 표를 만들어 주십시오.');
     var rl = L.rpmList(st.rpmStart, st.rpmEnd, st.rpmStep);
     if (!rl.ok) errs = errs.concat(rl.errors);
-    var isConst = st.forceMode === 'const';
-    var vo = L.validateOrders(st.orders, isConst);
+    var mode = MODE_SHORT[st.forceMode] ? st.forceMode : 'const';
+    var isConst = mode === 'const', scaleOn = !!st.scaleOn;
+    var vo = L.validateOrders(st.orders, isConst && !scaleOn);
     if (!vo.ok) errs = errs.concat(vo.errors);
-    var force = null;
-    if (!isConst) {
-      if (state.forceFile && state.forceFile.source !== 'estimate') {
+    var nums = vo.ok ? vo.orders.map(function (o) { return o.order; }) : [];
+    var sc = null;
+    if (vo.ok && scaleOn) { sc = L.scaleRatios(st.orders, nums, st.refOrder); if (!sc.ok) { errs = errs.concat(sc.errors); sc = null; } }
+    var force = null, orders = vo.ok ? vo.orders : [];
+    if (isConst) {
+      if (scaleOn && sc) {
+        var refRow = st.orders.filter(function (o) { return L.toNumber(o.order) === sc.ref; })[0];
+        var cf = L.constForcesByScale(nums, sc.ratio, refRow && refRow.force);
+        if (!cf.ok) errs = errs.concat(cf.errors); else { orders = cf.orders; force = { mode: 'const', orders: orders }; }
+      } else if (vo.ok && !scaleOn) force = { mode: 'const', orders: orders };
+    } else if (mode === 'vector') {
+      if (vo.ok && (!scaleOn || sc)) {
+        var keys = scaleOn ? [sc.ref] : nums;
+        var pv = L.parseForceVector(st.vectorRows, keys);
+        if (!pv.ok) errs = errs.concat(pv.errors);
+        else force = { mode: 'table', table: scaleOn ? L.expandTableByScale(pv.table, nums, sc.ratio, sc.ref).table : pv.table };
+      }
+    } else {
+      var fromEst = state.forceFile && state.forceFile.source === 'estimate';
+      if (state.forceFile && !fromEst) {
         var info = fileRowsInfo(state.forceFile);
         var pt = L.parseForceTable(info.data, state.forceFile.map);
         if (!pt.ok) errs = errs.concat(pt.errors); else state.forceTable = pt.table;
       }
       if (!state.forceTable) { if (!errs.length) errs.push('RPM별 가진력 표를 불러와 주십시오.'); }
-      else force = { mode: 'table', table: state.forceTable };
-      if (vo.ok && state.forceTable) vo.orders.forEach(function (o) { if (!state.forceTable.byOrder[o.order]) errs.push(o.order + '차의 가진력 열을 지정해 주십시오.'); });
-    } else if (vo.ok) force = { mode: 'const', orders: vo.orders };
+      else if (vo.ok && (!scaleOn || sc || fromEst)) {
+        var need = scaleOn && !fromEst ? [sc.ref] : nums;
+        need.forEach(function (k) { if (!state.forceTable.byOrder[k]) errs.push(k + '차의 가진력 열을 지정해 주십시오.'); });
+        if (!errs.length) force = { mode: 'table', table: scaleOn && !fromEst ? L.expandTableByScale(state.forceTable, nums, sc.ratio, sc.ref).table : state.forceTable };
+      }
+    }
     var ri = L.INTERP[st.interp] ? st.interp : 'linear';
     if (errs.length) return { ok: false, errors: errs };
-    return { ok: true, cfg: { rpms: rl.list, orders: vo.orders, force: force, interp: ri } };
+    return { ok: true, cfg: { rpms: rl.list, orders: orders, force: force, interp: ri, forceMode: mode, scale: sc ? { ref: sc.ref, factors: sc.factors } : null } };
   }
   function runCalc() {
     var c = configFromSettings();
@@ -372,13 +483,13 @@
     add(wrap, alertBox('warn', '확인할 점', result.warnings));
     wrap.appendChild(el('section', { class: 'card' },
       el('div', { class: 'btn-row', style: 'justify-content:space-between;margin-bottom:10px' },
-        el('p', { class: 'note', style: 'margin:0' }, 'RPM ' + L.fmt(cfg.rpms[0]) + '~' + L.fmt(cfg.rpms[cfg.rpms.length - 1]) + ' (' + cfg.rpms.length + '점) · 차수 ' + cfg.orders.map(function (o) { return o.order; }).join(', ') + ' · ' + L.INTERP[cfg.interp] + ' · 가진력 ' + (cfg.force.mode === 'table' ? 'RPM별 표' : '차수별 상수')),
+        el('p', { class: 'note', style: 'margin:0' }, 'RPM ' + L.fmt(cfg.rpms[0]) + '~' + L.fmt(cfg.rpms[cfg.rpms.length - 1]) + ' (' + cfg.rpms.length + '점) · 차수 ' + cfg.orders.map(function (o) { return o.order; }).join(', ') + ' · ' + L.INTERP[cfg.interp] + ' · 가진력 ' + MODE_SHORT[cfg.forceMode] + (cfg.scale ? ' · scale factor(기준 ' + cfg.scale.ref + '차)' : '')),
         el('div', { class: 'btn-row' },
           el('button', { type: 'button', class: 'btn btn-primary', id: 'xlsxBtn', onclick: function () {
-            downloadSheets(outName('RPM별응답', 'xlsx'), L.resultToSheets(result, cfg.orders, { fileName: state.frfFile && state.frfFile.name, interp: cfg.interp, forceMode: cfg.force.mode, forceUnit: st.forceUnit, sample: state.sample, created: nowText() }));
+            downloadSheets(outName('RPM별응답', 'xlsx'), L.resultToSheets(result, cfg.orders, { fileName: state.frfFile && state.frfFile.name, interp: cfg.interp, forceMode: cfg.forceMode, scale: cfg.scale, forceUnit: st.forceUnit, sample: state.sample, created: nowText() }));
           } }, '결과 엑셀 내려받기'),
           el('button', { type: 'button', class: 'btn', id: 'csvBtn', onclick: function () {
-            var sh = L.resultToSheets({ points: [p] }, cfg.orders, { forceMode: cfg.force.mode })[1];
+            var sh = L.resultToSheets({ points: [p] }, cfg.orders, { forceMode: cfg.forceMode })[1];
             download(outName('RPM별응답_' + baseOf(p.name), 'csv'), new Blob([L.toCsv(sh.rows)], { type: 'text/csv;charset=utf-8' }));
           } }, '이 응답점 CSV'))),
       result.points.length > 1 ? el('div', { class: 'point-tabs', role: 'group', 'aria-label': '응답점' }, result.points.map(function (q, i) {
@@ -480,44 +591,121 @@
       el('ul', { class: 'legend' }, series.map(function (sr) { return el('li', null, el('i', { style: 'border-color:' + sr.color + ';border-top-width:' + sr.width + 'px' }), sr.name); })));
   }
 
+  // 범용 XY 그래프 — series: [{name, color, width(0 이면 선 없음), pts:[[x,y]], marker: true|'hollow'}]
+  function xyChart(o) {
+    var W = 900, H = 400, m = { l: 74, r: 18, t: 18, b: 52 }, logY = !!o.logY;
+    var NS = 'http://www.w3.org/2000/svg';
+    function s(tag, attrs, txt) { var n = document.createElementNS(NS, tag); Object.keys(attrs).forEach(function (k) { n.setAttribute(k, attrs[k]); }); if (txt != null) n.textContent = txt; return n; }
+    function good(y) { return y != null && isFinite(y) && (!logY || y > 0); }
+    var svg = s('svg', { viewBox: '0 0 ' + W + ' ' + H, xmlns: NS, role: 'img', 'aria-label': o.aria || '', 'font-family': 'sans-serif', 'font-size': '14' });
+    svg.appendChild(s('rect', { x: 0, y: 0, width: W, height: H, fill: '#fff' }));
+    var xs = [], ys = [];
+    o.series.forEach(function (sr) { sr.pts.forEach(function (q) { if (good(q[1])) { xs.push(q[0]); ys.push(q[1]); } }); });
+    var box = el('div', { class: 'chart-box', id: o.id });
+    if (!ys.length) { svg.appendChild(s('text', { x: W / 2, y: H / 2, 'text-anchor': 'middle', fill: '#555' }, '그릴 값이 없습니다')); box.appendChild(svg); return box; }
+    var xmin = Math.min.apply(null, xs), xmax = Math.max.apply(null, xs);
+    if (xmax === xmin) { xmin -= 1; xmax += 1; }
+    var ymin, ymax, ty;
+    if (logY) {
+      var lo = Math.floor(Math.log10(Math.min.apply(null, ys))), hi = Math.ceil(Math.log10(Math.max.apply(null, ys)));
+      if (hi === lo) hi = lo + 1;
+      ymin = lo; ymax = hi; ty = []; for (var e = lo; e <= hi; e++) ty.push(e);
+    } else { ty = L.niceTicks(Math.min(0, Math.min.apply(null, ys)), Math.max.apply(null, ys), 5); ymin = ty[0]; ymax = ty[ty.length - 1]; }
+    var tx = L.niceTicks(xmin, xmax, 6).filter(function (v) { return v >= xmin && v <= xmax; });
+    function X(v) { return m.l + (v - xmin) / (xmax - xmin) * (W - m.l - m.r); }
+    function Yt(t) { return H - m.b - (t - ymin) / (ymax - ymin) * (H - m.t - m.b); }
+    function Y(v) { return Yt(logY ? Math.log10(v) : v); }
+    ty.forEach(function (v) {
+      svg.appendChild(s('line', { x1: m.l, x2: W - m.r, y1: Yt(v), y2: Yt(v), stroke: '#e3e7ec' }));
+      svg.appendChild(s('text', { x: m.l - 8, y: Yt(v) + 5, 'text-anchor': 'end', fill: '#444' }, logY ? L.fmt(Math.pow(10, v), 3) : L.fmt(v, 4)));
+    });
+    tx.forEach(function (v) {
+      svg.appendChild(s('line', { x1: X(v), x2: X(v), y1: m.t, y2: H - m.b, stroke: '#eef1f4' }));
+      svg.appendChild(s('text', { x: X(v), y: H - m.b + 20, 'text-anchor': 'middle', fill: '#444' }, L.fmt(v, 6)));
+    });
+    svg.appendChild(s('line', { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: '#333' }));
+    svg.appendChild(s('line', { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, stroke: '#333' }));
+    svg.appendChild(s('text', { x: (m.l + W - m.r) / 2, y: H - 10, 'text-anchor': 'middle', fill: '#222' }, 'RPM'));
+    svg.appendChild(s('text', { x: 16, y: (m.t + H - m.b) / 2, 'text-anchor': 'middle', fill: '#222', transform: 'rotate(-90 16 ' + (m.t + H - m.b) / 2 + ')' }, o.yLabel || ''));
+    o.series.forEach(function (sr) {
+      if (sr.width > 0) {
+        var d = '', pen = false;
+        sr.pts.forEach(function (q) {
+          if (!good(q[1])) { pen = false; return; }
+          d += (pen ? 'L' : 'M') + X(q[0]).toFixed(1) + ' ' + Y(q[1]).toFixed(1) + ' '; pen = true;
+        });
+        if (d) svg.appendChild(s('path', { d: d, fill: 'none', stroke: sr.color, 'stroke-width': sr.width, 'stroke-linejoin': 'round' }));
+      }
+      if (sr.marker) sr.pts.forEach(function (q) {
+        if (good(q[1])) svg.appendChild(s('circle', { cx: X(q[0]).toFixed(1), cy: Y(q[1]).toFixed(1), r: 4.5, fill: sr.marker === 'hollow' ? '#fff' : sr.color, stroke: sr.color, 'stroke-width': 2 }));
+      });
+    });
+    box.appendChild(svg);
+    return el('div', null, box, el('ul', { class: 'legend' }, o.series.map(function (sr) {
+      return el('li', null, sr.width > 0 ? el('i', { style: 'border-color:' + sr.color + ';border-top-width:' + sr.width + 'px' }) : el('b', { class: 'dot', style: 'border-color:' + sr.color }), sr.name);
+    })));
+  }
+
   // ── 4. 가진력 추정 ────────────────────────────────────────────
   function viewForce() {
     var wrap = el('div');
     wrap.appendChild(el('div', { class: 'page-head' }, el('h1', null, '4. 계측 데이터로 가진력 추정')));
     wrap.appendChild(steps());
     wrap.appendChild(el('div', { class: 'alert info' },
-      el('p', { style: 'margin:0 0 4px' }, '가진력 = |계측 응답| ÷ |FRF(차수 × RPM / 60)| 로 구합니다(단일 가진점 가정, 기획서 4장).'),
+      el('p', { style: 'margin:0 0 4px' }, '계산 응답(|FRF| × 가진력)과 계측 응답의 차이가 가장 작아지도록 가진력을 구합니다(최소제곱, 단일 가진점 가정 — 기획서 4·11장).'),
       el('p', { style: 'margin:0' }, '계측 파일은 「한 행 = RPM·차수 하나, 응답점마다 계측값 열 하나」로 정리된 표라고 가정합니다. 실제 계측 형식(시간 신호 등)을 받으면 2단계에서 맞춥니다.')));
     if (!state.frf) { wrap.appendChild(el('div', { class: 'alert info' }, '먼저 ', el('a', { href: '#/frf' }, '1. FRF 불러오기'), '에서 FRF 표를 만들어 주십시오.')); return wrap; }
     var mf = state.measFile;
     wrap.appendChild(el('section', { class: 'card' },
       el('h2', null, '계측 파일'),
       fileInput('계측 응답 파일', function (nf) {
-        state.measFile = nf; state.measMap = guessMeasMap(fileRowsInfo(nf).headers); estimate = null; save(); render();
+        state.measFile = nf; state.measMap = guessMeasMap(fileRowsInfo(nf).headers); estimate = null; fit = null; save(); render();
       }),
       mf ? el('p', { style: 'margin-top:10px' }, '불러온 파일: ', el('strong', null, mf.name)) : null,
-      mf ? fileControls(mf, function (reguess) { if (reguess) state.measMap = guessMeasMap(fileRowsInfo(mf).headers); estimate = null; save(); render(); }) : null));
+      mf ? fileControls(mf, function (reguess) { if (reguess) state.measMap = guessMeasMap(fileRowsInfo(mf).headers); estimate = null; fit = null; save(); render(); }) : null));
     if (!mf) return wrap;
     var info = fileRowsInfo(mf), mm = state.measMap || guessMeasMap(info.headers);
     state.measMap = mm;
-    var rpmSel = colSelect('measRpmCol', info.headers, mm.rpmCol); rpmSel.addEventListener('change', function () { mm.rpmCol = +this.value; estimate = null; save(); });
-    var ordSel = colSelect('measOrderCol', info.headers, mm.orderCol); ordSel.addEventListener('change', function () { mm.orderCol = +this.value; estimate = null; save(); });
+    var rpmSel = colSelect('measRpmCol', info.headers, mm.rpmCol); rpmSel.addEventListener('change', function () { mm.rpmCol = +this.value; estimate = null; fit = null; save(); });
+    var ordSel = colSelect('measOrderCol', info.headers, mm.orderCol); ordSel.addEventListener('change', function () { mm.orderCol = +this.value; estimate = null; fit = null; save(); });
     var st = state.settings;
-    var ratioIn = el('input', { type: 'number', name: 'antiRatio', step: 'any', min: 0, value: String(st.antiRatio == null ? '' : st.antiRatio), oninput: function () { st.antiRatio = this.value; estimate = null; save(); } });
+    var ratioIn = el('input', { type: 'number', name: 'antiRatio', step: 'any', min: 0, value: String(st.antiRatio == null ? '' : st.antiRatio), oninput: function () { st.antiRatio = this.value; estimate = null; fit = null; save(); } });
+    var methodRow = el('div', { class: 'radio-row', role: 'radiogroup', 'aria-label': '추정 방식' },
+      [['each', 'RPM·차수마다 따로'], ['scale', 'scale factor 고정 — 기준 차수의 RPM별 크기'], ['poly', 'scale factor 미고정 — 차수별 다항식']].map(function (o) {
+        return el('label', null, el('input', { type: 'radio', name: 'estMode', value: o[0], checked: st.estMode === o[0], onchange: function () { st.estMode = o[0]; estimate = null; fit = null; save(); render(); } }), o[1]);
+      }));
+    var methodNote;
+    if (st.estMode === 'scale') {
+      var sc = st.scaleOn ? currentScale() : null;
+      methodNote = sc && sc.ok
+        ? el('p', { class: 'note' }, '2. 계산 조건의 scale factor 를 씁니다 — 기준 ' + sc.ref + '차, ' + validOrderNumbers().map(function (k) { return k + '차 ' + sc.factors[k]; }).join(', ') + '. RPM 점마다 모든 차수·응답점 관측으로 F_기준(RPM) = Σ a·m ÷ Σ a² (a = |FRF| × s_k/s_기준) 를 구합니다. ',
+          el('a', { href: '#/calc' }, 'scale factor 고치기'))
+        : el('div', { class: 'alert warn' }, '2. 계산 조건에서 「차수별 scale factor 사용」을 켜고 계측 표의 모든 차수에 scale factor 와 기준 차수를 넣어 주십시오. ', el('a', { href: '#/calc' }, '2. 계산 조건으로'));
+    } else if (st.estMode === 'poly') {
+      methodNote = el('div', null,
+        el('div', { class: 'form-grid', style: 'margin-top:8px' }, field('가진력 형태 (다항식 차수 n)', el('select', { name: 'polyDegree', onchange: function () { st.polyDegree = +this.value; fit = null; save(); } },
+          [0, 1, 2, 3, 4, 5].map(function (n) { return el('option', { value: String(n), selected: +st.polyDegree === n }, n + '차 ' + ['(상수)', '(직선)', '(2차 함수)', '(3차 함수)', '(4차 함수)', '(5차 함수)'][n]); })), '차수마다 F_k(RPM) = c0 + c1·RPM + … + cn·RPMⁿ')),
+        el('p', { class: 'note', style: 'margin-top:8px' }, '계측 ≈ |FRF| × F_k(RPM) 의 제곱오차 합이 가장 작은 계수를 선형 최소제곱(QR 분해)으로 구합니다. 차수마다 계측 RPM 점이 n+1개 이상 있어야 합니다.'));
+    } else {
+      methodNote = el('p', { class: 'note' }, 'RPM·차수마다 가진력 = |계측| ÷ |FRF| 를 응답점별로 구하고, 응답점이 여럿이면 최소제곱으로 하나로 합칩니다(1단계 방식).');
+    }
     wrap.appendChild(el('section', { class: 'card' },
       el('h2', null, '열 짝짓기'),
       el('div', { class: 'form-grid' }, field('RPM 열', rpmSel), field('차수 열', ordSel),
-        field('반공진 경고 기준', ratioIn, '그 응답점 최대 |FRF| 에 이 비율을 곱한 값보다 |FRF| 가 작으면 경고하고 종합값에서 뺍니다. 값은 해석자가 정합니다.')),
+        field('반공진 경고 기준', ratioIn, '그 응답점 최대 |FRF| 에 이 비율을 곱한 값보다 |FRF| 가 작으면 경고하고 맞춤에서 뺍니다. 값은 해석자가 정합니다.')),
       el('div', { class: 'table-wrap', style: 'margin-top:14px' }, el('table', { class: 'grid map' },
         el('thead', null, el('tr', null, el('th', null, 'FRF 응답점'), el('th', null, '계측값 열'))),
         el('tbody', null, state.frf.points.map(function (p) {
           var sel = colSelect('measPointCol', info.headers, mm.pointCols[p.name] == null ? -1 : mm.pointCols[p.name], true);
           sel.className = 'cell-input';
-          sel.addEventListener('change', function () { mm.pointCols[p.name] = +this.value; estimate = null; save(); });
+          sel.addEventListener('change', function () { mm.pointCols[p.name] = +this.value; estimate = null; fit = null; save(); });
           return el('tr', null, el('td', null, p.name), el('td', null, sel));
         })))),
+      el('h3', { style: 'margin-top:18px' }, '추정 방식'),
+      methodRow, methodNote,
       el('div', { class: 'actions' }, el('button', { type: 'button', class: 'btn btn-primary', id: 'estBtn', onclick: runEstimate }, '가진력 추정'))));
-    if (estimate) wrap.appendChild(estimateCard());
+    if (estimate && st.estMode === 'each') wrap.appendChild(estimateCard());
+    if (fit && fit.mode === st.estMode) wrap.appendChild(fitCard());
     return wrap;
   }
   function guessMeasMap(headers) {
@@ -541,10 +729,131 @@
     if (!pm.ok) { render(); var b = alertBox('error', '추정하지 못했습니다', pm.errors); b.id = 'estErrors'; main.appendChild(b); return; }
     var ratio = L.toNumber(state.settings.antiRatio);
     if (isNaN(ratio) || ratio < 0) { render(); main.appendChild(alertBox('error', '추정하지 못했습니다', ['반공진 경고 기준을 0 이상의 숫자로 입력해 주십시오.'])); return; }
-    estimate = L.estimateForce(state.frf, pm, { interp: state.settings.interp, antiRatio: ratio });
+    var st = state.settings, opts = { interp: st.interp, antiRatio: ratio };
+    if (st.estMode === 'scale' || st.estMode === 'poly') {
+      var r;
+      if (st.estMode === 'scale') {
+        var sc = st.scaleOn ? currentScale() : { ok: false, errors: ['2. 계산 조건에서 「차수별 scale factor 사용」을 켜고 값을 넣어 주십시오.'] };
+        r = sc.ok ? L.estimateScaleFixed(state.frf, pm, { interp: st.interp, antiRatio: ratio, ratio: sc.ratio, ref: sc.ref }) : sc;
+        if (r.ok) r.factors = sc.factors;
+      } else r = L.estimatePoly(state.frf, pm, { interp: st.interp, antiRatio: ratio, degree: st.polyDegree });
+      if (!r.ok) { fit = null; render(); var eb = alertBox('error', '추정하지 못했습니다', r.errors); eb.id = 'estErrors'; main.appendChild(eb); eb.scrollIntoView({ block: 'nearest' }); return; }
+      fit = r;
+      fit.each = L.estimateForce(state.frf, pm, opts);   // 그래프에 점으로 겹쳐 보일 「따로 구한 값」
+      fit.meta = { skipped: pm.skipped, points: pm.points, ratio: ratio };
+      render();
+      var fc = document.getElementById('fitCard'); if (fc) fc.scrollIntoView({ block: 'start' });
+      return;
+    }
+    estimate = L.estimateForce(state.frf, pm, opts);
     estimate.meta = { skipped: pm.skipped, points: pm.points, ratio: ratio };
     render();
     var c = document.getElementById('estCard'); if (c) c.scrollIntoView({ block: 'start' });
+  }
+
+  // 새 추정 방식(scale 고정·다항식)의 결과 — 계수, RPM별 가진력 그래프, 계산 vs 계측 그래프, 잔차
+  function fitCard() {
+    var st = state.settings, f = fit, unit = st.forceUnit ? ' (' + st.forceUnit + ')' : '';
+    var excluded = f.obs.filter(function (o) { return !o.use; });
+    var anti = excluded.filter(function (o) { return o.anti; }).length;
+    var notes = [];
+    if (anti) notes.push('반공진 부근(|FRF| 가 작아 오차가 커지기 쉬운 곳)으로 본 관측 ' + anti + '개를 맞춤에서 뺐습니다.');
+    if (excluded.length - anti) notes.push('FRF 범위 밖이거나 계측값이 비어 쓰지 못한 관측이 ' + (excluded.length - anti) + '개 있습니다.');
+    if (f.meta.skipped) notes.push('RPM·차수가 숫자가 아닌 행 ' + f.meta.skipped + '개를 건너뛰었습니다.');
+    var coef;
+    if (f.mode === 'scale') {
+      coef = el('div', null,
+        el('p', { class: 'note' }, '기준 ' + f.ref + '차의 RPM별 크기를 RPM 점마다 최소제곱으로 구했습니다. 다른 차수는 scale factor 비(' + f.orders.map(function (k) { return k + '차 ' + L.fmt(f.ratio[k], 4); }).join(', ') + ') × 기준입니다.'),
+        el('div', { class: 'table-wrap tall' }, el('table', { class: 'grid', id: 'fitCoefTable' },
+          el('thead', null, el('tr', null, el('th', null, 'RPM'), el('th', null, '기준 ' + f.ref + '차 추정' + unit), el('th', null, '쓴 관측'), f.orders.map(function (k) { return el('th', null, k + '차' + unit); }))),
+          el('tbody', null, f.rpms.map(function (r, i) {
+            return el('tr', null, el('td', null, L.fmt(r, 6)), el('td', null, el('strong', null, L.fmt(f.refForce[i]))), el('td', null, String(f.used[i])), f.orders.map(function (k) { return el('td', null, L.fmt(f.table.byOrder[k][i])); }));
+          })))));
+    } else {
+      coef = el('div', null,
+        el('p', { class: 'note' }, '차수마다 F_k(RPM) = Σ c_j·RPMʲ 의 계수입니다(RPM 은 그대로의 값, 가진력 단위' + (st.forceUnit ? ' ' + st.forceUnit : '') + '). 계측 RPM 범위 밖으로 늘여 쓰면(외삽) 값이 크게 틀릴 수 있습니다.'),
+        el('div', { class: 'table-wrap' }, el('table', { class: 'grid', id: 'fitCoefTable' },
+          el('thead', null, el('tr', null, el('th', null, '차수'), Array.apply(null, Array(f.degree + 1)).map(function (_, j) { return el('th', null, 'c' + j); }), el('th', null, '쓴 관측'), el('th', { class: 'text' }, '식'))),
+          el('tbody', null, f.fits.map(function (ft) {
+            return el('tr', null, el('td', null, ft.order + '차'), ft.coef.map(function (c) { return el('td', null, L.fmt(c, 6)); }), el('td', null, String(ft.n)), el('td', { class: 'text' }, L.polyText(ft.coef)));
+          })))));
+    }
+    // RPM별 가진력 그래프: 선 = 추정, 점 = RPM·차수마다 따로 구한 값
+    var fSeries = [], rmin = f.rpms[0], rmax = f.rpms[f.rpms.length - 1];
+    f.orders.forEach(function (k, i) {
+      var color = COLORS[i % COLORS.length], pts = [];
+      if (f.mode === 'poly') {
+        var ft = f.fits.filter(function (x) { return x.order === k; })[0];
+        for (var t = 0; t <= 100; t++) { var r = rmin + (rmax - rmin) * t / 100; pts.push([r, L.polyEval(ft.coef, r)]); }
+      } else pts = f.rpms.map(function (r, j) { return [r, f.table.byOrder[k][j]]; });
+      fSeries.push({ name: k + '차 추정', color: color, width: 2.5, pts: pts, marker: f.mode === 'scale' });
+      fSeries.push({ name: k + '차 따로 구한 값', color: color, width: 0, pts: f.each.rows.filter(function (r) { return r.order === k; }).map(function (r) { return [r.rpm, r.ls]; }), marker: 'hollow' });
+    });
+    // 계산 vs 계측 그래프 (응답점 하나)
+    var pts = f.meta.points;
+    if (ui.fitPoint >= pts.length) ui.fitPoint = 0;
+    var pname = pts[ui.fitPoint], cSeries = [];
+    f.orders.forEach(function (k, i) {
+      var color = COLORS[i % COLORS.length];
+      var mine = f.obs.filter(function (o) { return o.point === pname && o.order === k; }).sort(function (a, b) { return a.rpm - b.rpm; });
+      cSeries.push({ name: k + '차 계산', color: color, width: 2.5, pts: mine.map(function (o) { return [o.rpm, o.calc]; }) });
+      cSeries.push({ name: k + '차 계측', color: color, width: 0, pts: mine.map(function (o) { return [o.rpm, o.meas]; }), marker: 'hollow' });
+    });
+    var statRows = f.stats.concat(f.statsByPoint.slice(1)).map(function (g) {
+      return el('tr', null, el('td', { class: 'text' }, g.key), el('td', null, String(g.n)), el('td', null, L.fmt(g.rms)), el('td', null, g.rmsDb == null ? '-' : L.fmt(g.rmsDb, 3) + ' dB'), el('td', null, g.maxDb == null ? '-' : L.fmt(g.maxDb, 3) + ' dB'));
+    });
+    return el('section', { class: 'card', id: 'fitCard' },
+      el('div', { class: 'btn-row', style: 'margin-bottom:10px' },
+        el('h2', { style: 'margin:0;margin-right:auto' }, f.mode === 'scale' ? '추정 결과 — scale factor 고정' : '추정 결과 — ' + f.degree + '차 다항식'),
+        el('button', { type: 'button', class: 'btn btn-primary', id: 'fitXlsxBtn', onclick: function () {
+          downloadSheets(outName('가진력추정_' + (f.mode === 'scale' ? 'scale고정' : f.degree + '차다항식'), 'xlsx'), L.fitToSheets(f, { fileName: state.frfFile && state.frfFile.name, measFile: state.measFile.name, interp: st.interp, antiRatio: f.meta.ratio, sample: state.sample, created: nowText() }));
+        } }, '추정 엑셀 내려받기'),
+        el('button', { type: 'button', class: 'btn', id: 'useFitBtn', onclick: useFit }, '추정 가진력을 계산에 쓰기')),
+      alertBox('warn', null, notes),
+      el('h3', null, f.mode === 'scale' ? '기준 차수 RPM별 크기' : '추정 계수'),
+      coef,
+      el('div', { class: 'btn-row', style: 'margin:18px 0 6px' }, el('h3', { style: 'margin:0;margin-right:auto' }, 'RPM별 추정 가진력'), svgSaveBtn('fitForceChart', '추정가진력그래프')),
+      el('p', { class: 'note' }, '선 = 이번 추정, 빈 원 = RPM·차수마다 따로 구한 값(1단계 방식). 둘이 크게 어긋나면 가정한 형태(scale 비·다항식 차수)가 계측과 맞지 않는다는 뜻입니다.'),
+      xyChart({ id: 'fitForceChart', series: fSeries, yLabel: '가진력' + unit, aria: 'RPM별 추정 가진력 그래프' }),
+      el('div', { class: 'btn-row', style: 'margin:18px 0 6px' }, el('h3', { style: 'margin:0;margin-right:auto' }, '계산 vs 계측 — ' + pname),
+        el('button', { type: 'button', class: 'btn btn-small', 'aria-pressed': ui.logY ? 'true' : 'false', onclick: function () { ui.logY = !ui.logY; render(); } }, '세로축 로그'),
+        svgSaveBtn('fitCmpChart', '계산대비계측_' + baseOf(pname))),
+      pts.length > 1 ? el('div', { class: 'point-tabs', role: 'group', 'aria-label': '비교 응답점' }, pts.map(function (n, i) {
+        return el('button', { type: 'button', class: 'btn btn-small', 'aria-pressed': i === ui.fitPoint ? 'true' : 'false', onclick: function () { ui.fitPoint = i; render(); } }, n);
+      })) : null,
+      el('p', { class: 'note' }, '선 = 계산(|FRF| × 추정 가진력), 빈 원 = 계측.'),
+      xyChart({ id: 'fitCmpChart', series: cSeries, yLabel: '응답' + (ui.logY ? ' (로그)' : ''), aria: pname + ' 계산 대비 계측 그래프', logY: ui.logY }),
+      el('h3', { style: 'margin-top:18px' }, '잔차'),
+      el('p', { class: 'note' }, 'RMS = √(Σ(계산 − 계측)² ÷ n) (응답 단위), dB 오차 = 20·log10(계산 ÷ 계측). 맞춤에 쓴 관측만 셉니다.'),
+      el('div', { class: 'table-wrap' }, el('table', { class: 'grid', id: 'fitStatTable' },
+        el('thead', null, el('tr', null, el('th', { class: 'text' }, '구분'), el('th', null, '관측 수'), el('th', null, 'RMS 오차'), el('th', null, 'RMS dB 오차'), el('th', null, '최대 |dB| 오차'))),
+        el('tbody', null, statRows))));
+  }
+  function svgSaveBtn(id, kind) {
+    return el('button', { type: 'button', class: 'btn btn-small', onclick: function () {
+      var svg = document.querySelector('#' + id + ' svg');
+      if (svg) download(outName(kind, 'svg'), new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n' + svg.outerHTML], { type: 'image/svg+xml' }));
+    } }, '그래프 SVG 저장');
+  }
+  // 추정 가진력을 「RPM 연동 벡터」로 넣어 2. 계산 조건에서 바로 쓰게 합니다
+  function useFit() {
+    var st = state.settings, f = fit;
+    var scales = {};
+    st.orders.forEach(function (o) { scales[L.toNumber(o.order)] = o.scale; });
+    st.orders = f.orders.map(function (k) { return { order: k, force: '', scale: scales[k] == null ? '' : scales[k] }; });
+    st.forceMode = 'vector';
+    if (f.mode === 'scale') {
+      st.scaleOn = true; st.refOrder = f.ref;
+      st.vectorRows = f.rpms.map(function (r, i) { var v = {}; v[f.ref] = f.refForce[i] == null ? '' : L.round(f.refForce[i], 9); return { rpm: r, v: v }; });
+    } else {
+      st.scaleOn = false;
+      st.vectorRows = f.rpms.map(function (r, i) { var v = {}; f.orders.forEach(function (k) { v[k] = L.round(f.table.byOrder[k][i], 9); }); return { rpm: r, v: v }; });
+    }
+    st.rpmStart = f.rpms[0]; st.rpmEnd = f.rpms[f.rpms.length - 1];
+    if (!(L.toNumber(st.rpmStep) > 0)) st.rpmStep = f.rpms.length > 1 ? f.rpms[1] - f.rpms[0] : 1;
+    result = null; save();
+    toast('추정 가진력을 RPM 연동 벡터로 넣었습니다. 계산 조건을 확인하고 계산해 주십시오.');
+    location.hash = '#/calc';
   }
   function estimateCard() {
     var pts = estimate.meta.points;
@@ -596,6 +905,16 @@
       el('section', { class: 'card' },
         el('h2', null, '계산식 (수강생 원문 참고 1·2)'),
         el('div', { class: 'formula' }, '가진 주파수   f = 차수 × RPM / 60            [Hz]\n차수 응답     R_k(RPM) = |FRF(f)| × F_k(RPM)\noverall       R(RPM) = √( Σ_k R_k(RPM)² )     (RSS)\n가진력 추정   F_k = |계측 응답| ÷ |FRF(f)|'),
+        el('h2', null, '가진력 입력 — scale factor 와 RPM 연동 벡터 (2026-09-29 추가)'),
+        el('div', { class: 'formula' }, 'RPM 연동 벡터   F_k(RPM) = 입력한 RPM 점 사이를 선형 보간 (범위 밖은 계산하지 않음)\nscale factor    F_k(RPM) = (s_k / s_기준) × F_기준(RPM)\n                예) s_1 = 0.5, s_2 = 1.0, s_3 = 0.2, 기준 2차 60 N → F_1 = 30 N, F_3 = 12 N'),
+        el('p', null, '차수별 상수·RPM 연동 벡터·가진력 표 파일 어느 방식에서도 scale factor 를 켜면 기준 차수 하나만 입력합니다.'),
+        el('h2', null, '가진력 추정 — 계산/계측 오차 최소화 (2026-09-29 추가)'),
+        el('div', { class: 'formula' }, '관측 i = (RPM_i, 차수 k_i, 응답점 p_i),  h_i = |H_p(k_i·RPM_i/60)|,  m_i = |계측_i|\n계산 응답        c_i = h_i × F_k(RPM_i)\n목표             Σ_i (c_i − m_i)² 최소\n\n(a) scale 고정   F_k(RPM) = r_k × F_기준(RPM),  r_k = s_k / s_기준\n                 RPM 점마다  F_기준(RPM) = Σ a_i·m_i / Σ a_i²,  a_i = h_i × r_k\n\n(b) 형태 지정    F_k(RPM) = c_0 + c_1·RPM + … + c_n·RPMⁿ   (차수마다 따로)\n                 A_ij = h_i × (RPM_i / RPM_max)ʲ,  min ‖A·β − m‖  (QR 분해)\n                 c_j = β_j / RPM_maxʲ\n\n잔차             RMS = √(Σ(c_i − m_i)² / n),  dB 오차 = 20·log10(c_i / m_i)'),
+        el('ul', null,
+          el('li', null, '크기(|FRF|·|계측|)로 맞춥니다. FRF 가 크기+위상·실수+허수로 와도 이 도구는 |FRF| 로 바꿔 두고, 계측 표도 RPM·차수별 크기라 위상이 없습니다. 가진점이 하나이면 |H·F| = |H|·|F| 라 크기만으로 모형이 정확합니다.'),
+          el('li', null, '반공진 부근(|FRF| 가 작은 곳)과 FRF 범위 밖 관측은 맞춤에서 뺍니다.'),
+          el('li', null, '(b) 는 RPM 을 최댓값으로 나눠 풀고 계수를 되돌립니다. 정규방정식(AᵀA)을 직접 풀면 3차 이상에서 오차가 커지기 쉬워 QR 분해를 씁니다.'),
+          el('li', null, '검증: 알려진 가진력으로 만든 합성 계측(노이즈 없음)에서 추정값이 원래 값과 1e-9 이내로 같고, ±2% 노이즈에서 3% 이내임을 테스트로 확인합니다.')),
         el('h2', null, '1단계에서 둔 가정 (실제 자료를 받으면 확정)'),
         el('ul', null,
           el('li', null, '차수는 회전 차수이며 가진 주파수 = 차수 × RPM / 60 입니다.'),
@@ -611,7 +930,7 @@
   }
 
   function steps() {
-    var done = [!!state.frf, !!(result || (state.settings.rpmStart !== '' && state.settings.rpmEnd !== '')), !!result, !!estimate];
+    var done = [!!state.frf, !!(result || (state.settings.rpmStart !== '' && state.settings.rpmEnd !== '')), !!result, !!(estimate || fit)];
     var items = [['1. FRF 불러오기', '열 짝짓기 → FRF 표'], ['2. 계산 조건', 'RPM·차수·가진력'], ['3. 결과', '그래프·표·엑셀'], ['4. 가진력 추정', '계측이 있을 때']];
     return el('ol', { class: 'steps' }, items.map(function (it, i) { return el('li', { class: done[i] ? 'done' : null }, el('b', null, it[0]), el('span', null, it[1])); }));
   }
@@ -628,19 +947,22 @@
     var b = L.buildFrf(s.frfRows.slice(1), state.frfMap);
     state.frf = b.frf; state.frfWarnings = b.warnings;
     var st = s.settings;
-    state.settings = { rpmStart: st.rpmStart, rpmEnd: st.rpmEnd, rpmStep: st.rpmStep, orders: st.orders.map(function (o) { return { order: o.order, force: o.force }; }), forceMode: st.forceMode, forceUnit: st.forceUnit, interp: st.interp, antiRatio: st.antiRatio };
+    state.settings = defaultSettings();
+    ['rpmStart', 'rpmEnd', 'rpmStep', 'forceMode', 'forceUnit', 'interp', 'antiRatio', 'refOrder', 'vectorStep'].forEach(function (k) { state.settings[k] = st[k]; });
+    state.settings.orders = st.orders.map(function (o) { return { order: o.order, force: o.force, scale: o.scale }; });
+    state.settings.vectorRows = st.vectorRows.map(function (r) { return { rpm: r.rpm, v: Object.assign({}, r.v) }; });
     state.forceFile = asFile(S.FILE_FORCE + '.csv', s.forceRows);
     state.forceFile.map = guessForceMap(s.forceRows[0]);
     state.measFile = asFile(S.FILE_MEAS + '.csv', s.measRows);
     state.measMap = guessMeasMap(s.measRows[0]);
-    result = null; estimate = null;
+    result = null; estimate = null; fit = null;
     save();
     toast('예시 데이터를 불러왔습니다(가상 값).');
     if (location.hash === '#/frf') render(); else location.hash = '#/frf';
   }
   function clearAll() {
     if (!window.confirm('불러온 파일·조건·결과를 이 브라우저에서 모두 지웁니다. 계속하시겠습니까?')) return;
-    Store.clear(); state = emptyState(); result = null; estimate = null; save();
+    Store.clear(); state = emptyState(); result = null; estimate = null; fit = null; save();
     toast('모두 지웠습니다.');
     if (location.hash === '#/frf') render(); else location.hash = '#/frf';
   }

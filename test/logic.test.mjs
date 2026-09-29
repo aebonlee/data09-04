@@ -181,6 +181,150 @@ test('예시 계측은 예시 가진력으로 만든 값이라 추정값이 그 
   });
 });
 
+console.log('가진력 scale factor · RPM 연동 벡터 (2026-09-29 요청 1)');
+// 예: 1차 0.5, 2차 1.0, 3차 0.2, 기준 2차 → F_k = (s_k / s_2) × F_2
+test('scale 비: 기준 2차(s=1) → 1차 0.5·3차 0.2', () => {
+  const r = L.scaleRatios([{ order: 1, scale: 0.5 }, { order: 2, scale: 1 }, { order: 3, scale: 0.2 }], [1, 2, 3], 2);
+  assert.ok(r.ok); near(r.ratio[1], 0.5); near(r.ratio[2], 1); near(r.ratio[3], 0.2);
+});
+test('scale 비: 기준 1차(s=0.5) → 2차 2배, 3차 0.4배', () => {
+  const r = L.scaleRatios([{ order: 1, scale: 0.5 }, { order: 2, scale: 1 }, { order: 3, scale: 0.2 }], [1, 2, 3], 1);
+  near(r.ratio[2], 2); near(r.ratio[3], 0.4);
+});
+test('상수 모드 + scale: 기준 2차 60N → 1차 30, 3차 12', () => {
+  const r = L.scaleRatios([{ order: 1, scale: 0.5 }, { order: 2, scale: 1 }, { order: 3, scale: 0.2 }], [1, 2, 3], 2);
+  const c = L.constForcesByScale([1, 2, 3], r.ratio, '60');
+  assert.deepEqual(c.orders.map(o => o.order), [1, 2, 3]);
+  near(c.orders[0].force, 30); near(c.orders[1].force, 60); near(c.orders[2].force, 12);
+});
+test('scale 오류: 0 이하·빈칸·기준 차수 없음', () => {
+  const r = L.scaleRatios([{ order: 1, scale: 0 }, { order: 2, scale: '' }], [1, 2], 3);
+  assert.ok(!r.ok); assert.equal(r.errors.length, 3, r.errors.join(' / '));
+});
+test('붙여넣기: 탭·쉼표 구분, 머리행 건너뜀', () => {
+  assert.deepEqual(L.splitPasted('RPM\t1차\n800\t10\n1000\t12\n'), [['800', '10'], ['1000', '12']]);
+  assert.deepEqual(L.splitPasted('800, 10, 5\n\n1000 12 6'), [['800', '10', '5'], ['1000', '12', '6']]);
+});
+test('RPM 벡터: 정렬하고 forceAt 이 RPM 사이를 선형 보간', () => {
+  const v = L.parseForceVector([['1000', '20', '4'], ['800', '10', '2']], [1, 2]);
+  assert.ok(v.ok); assert.deepEqual(v.table.rpm, [800, 1000]);
+  near(L.forceAt({ mode: 'table', table: v.table }, 1, 900).value, 15);
+  near(L.forceAt({ mode: 'table', table: v.table }, 2, 950).value, 3.5);
+  assert.equal(L.forceAt({ mode: 'table', table: v.table }, 1, 1200).status, 'force_out_of_range');
+});
+test('RPM 벡터 오류: RPM 중복·음수 가진력', () => {
+  const v = L.parseForceVector([['800', '1'], ['800', '2'], ['900', '-1']], [1]);
+  assert.ok(!v.ok); assert.equal(v.errors.length, 2);
+});
+test('RPM 벡터 + scale: 기준 열 하나로 모든 차수 채움', () => {
+  const r = L.scaleRatios([{ order: 1, scale: 0.5 }, { order: 2, scale: 1 }, { order: 3, scale: 0.2 }], [1, 2, 3], 2);
+  const v = L.parseForceVector([['800', '10'], ['1000', '20']], [2]);
+  const e = L.expandTableByScale(v.table, [1, 2, 3], r.ratio, 2);
+  assert.deepEqual(e.table.byOrder[1], [5, 10]); assert.deepEqual(e.table.byOrder[2], [10, 20]);
+  near(e.table.byOrder[3][1], 4);
+});
+test('RPM 벡터로 응답 계산: 600rpm 1차 10Hz |H|=1 × F', () => {
+  const v = L.parseForceVector([['600', '2', '1'], ['1200', '4', '2']], [1, 2]);
+  const r = L.computeResponse(TINY, { rpms: [600], orders: [{ order: 1 }, { order: 2 }], force: { mode: 'table', table: v.table }, interp: 'linear' });
+  const row = r.points[0].rows[0];
+  near(row.comps[0].resp, 2); near(row.comps[1].resp, 3); near(row.overall, Math.sqrt(13));
+});
+
+console.log('최소제곱 (QR)');
+test('정방 3×3 을 정확히 푼다', () => {
+  const s = L.lstsq([[2, 1, 1], [1, 3, 2], [1, 0, 0]], [4, 5, 6]);
+  // 손풀이: 셋째 식 x=6 → 둘째·첫째 식에서 y=15, z=−23 (대입 확인: 12+15−23=4, 6+45−46=5)
+  assert.ok(s.ok); near(s.x[0], 6); near(s.x[1], 15); near(s.x[2], -23);
+});
+test('과결정: 직선 맞춤이 정규방정식 손풀이와 같음', () => {
+  // x = 0,1,2,3, y = 1,3,5,8 → 4a + 6b = 17, 6a + 14b = 37 → a = 16/20 = 0.8, b = 46/20 = 2.3
+  const s = L.lstsq([[1, 0], [1, 1], [1, 2], [1, 3]], [1, 3, 5, 8]);
+  near(s.x[0], 0.8, 1e-12); near(s.x[1], 2.3, 1e-12);
+});
+test('계수가 정해지지 않으면(같은 열 두 개) rank 오류', () => {
+  assert.equal(L.lstsq([[1, 1], [2, 2], [3, 3]], [1, 2, 3]).reason, 'rank');
+});
+test('다항식 식 표기', () => assert.equal(L.polyText([10, -0.5, 0.002]), 'F = 10 − 0.5·RPM + 0.002·RPM²'));
+
+console.log('가진력 추정 — 계산/계측 오차 최소화 (2026-09-29 요청 2)');
+// 합성 계측: 예시 FRF 로 |H|×F_참 을 만들어(노이즈 없음) 추정이 F_참 을 되돌리는지
+const SB = Sample.build();
+const SF = L.buildFrf(SB.frfRows.slice(1), L.guessMapping(SB.frfRows[0])).frf;
+function synth(forceFn, rpms, orders, noise) {
+  let seed = 7;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const rows = [];
+  rpms.forEach(rpm => orders.forEach(k => {
+    const values = {};
+    SF.points.forEach(p => {
+      const h = L.interpolate(SF.freq, p.mag, k * rpm / 60, 'linear').value;
+      values[p.name] = h * forceFn(k, rpm) * (1 + (noise ? (rnd() - 0.5) * 2 * noise : 0));
+    });
+    rows.push({ rpm, order: k, values });
+  }));
+  return { rows, points: SF.points.map(p => p.name) };
+}
+const RPMS = []; for (let r = 800; r <= 3000; r += 100) RPMS.push(r);
+const OPT = { interp: 'linear', antiRatio: 0 };
+test('(a) scale 고정, 노이즈 없음: 기준 차수 RPM별 크기를 1e-9 로 복원', () => {
+  const ratio = { 1: 0.5, 2: 1, 4: 0.2 };
+  const Fref = rpm => 40 + 30 * Math.sin(rpm / 400);      // 일부러 다항식이 아닌 모양
+  const est = L.estimateScaleFixed(SF, synth((k, r) => ratio[k] * Fref(r), RPMS, [1, 2, 4], 0), { ...OPT, ratio, ref: 2 });
+  assert.ok(est.ok);
+  est.rpms.forEach((r, i) => near(est.refForce[i] / Fref(r), 1, 1e-9));
+  near(est.table.byOrder[4][3] / (0.2 * Fref(est.rpms[3])), 1, 1e-9);
+  assert.ok(est.stats[0].rms < 1e-9 && est.stats[0].rmsDb < 1e-7, JSON.stringify(est.stats[0]));
+});
+test('(a) scale 고정, ±2% 노이즈: 복원 오차 3% 이내', () => {
+  const ratio = { 1: 0.5, 2: 1, 4: 0.2 };
+  const Fref = rpm => 40 + 30 * Math.sin(rpm / 400);
+  const est = L.estimateScaleFixed(SF, synth((k, r) => ratio[k] * Fref(r), RPMS, [1, 2, 4], 0.02), { ...OPT, ratio, ref: 2 });
+  est.rpms.forEach((r, i) => assert.ok(Math.abs(est.refForce[i] / Fref(r) - 1) < 0.03, `${r}rpm ${est.refForce[i]} vs ${Fref(r)}`));
+  assert.ok(est.stats[0].rmsDb > 0.01 && est.stats[0].rmsDb < 0.4, 'RMS dB ' + est.stats[0].rmsDb);
+});
+test('(a) scale factor 가 없는 계측 차수는 오류', () => {
+  const est = L.estimateScaleFixed(SF, synth(() => 1, [1000], [1, 3], 0), { ...OPT, ratio: { 1: 1 }, ref: 1 });
+  assert.ok(!est.ok); assert.match(est.errors[0], /3차/);
+});
+const TRUE_POLY = { 1: [50, 0.02, 1.5e-5], 2: [30, -0.004, 4e-6], 4: [5, 0.006, -1e-6] };
+test('(b) 2차 다항식, 노이즈 없음: 차수별 계수 c0·c1·c2 를 1e-9 로 복원', () => {
+  const est = L.estimatePoly(SF, synth((k, r) => L.polyEval(TRUE_POLY[k], r), RPMS, [1, 2, 4], 0), { ...OPT, degree: 2 });
+  assert.ok(est.ok, est.errors && est.errors.join());
+  est.fits.forEach(ft => ft.coef.forEach((c, j) => near(c / TRUE_POLY[ft.order][j], 1, 1e-9)));
+  assert.ok(est.stats[0].rms < 1e-9);
+});
+test('(b) 3차 다항식을 1차로 맞추면 잔차가 남고, 3차로 맞추면 0', () => {
+  const cub = { 1: [10, 0.01, -2e-6, 1e-9], 2: [8, 0.002, 1e-6, -2e-10], 4: [2, 0.001, 0, 1e-10] };
+  const meas = synth((k, r) => L.polyEval(cub[k], r), RPMS, [1, 2, 4], 0);
+  const e1 = L.estimatePoly(SF, meas, { ...OPT, degree: 1 });
+  const e3 = L.estimatePoly(SF, meas, { ...OPT, degree: 3 });
+  assert.ok(e1.stats[0].rmsDb > 0.05, 'e1 ' + e1.stats[0].rmsDb);
+  e3.fits.forEach(ft => ft.coef.forEach((c, j) => { if (cub[ft.order][j]) near(c / cub[ft.order][j], 1, 1e-7); }));
+});
+test('(b) 예시 계측(±2%)을 1차 다항식으로: 가상 참 가진력(RPM 선형)과 3% 이내', () => {
+  const pc = {}; SF.points.forEach(p => { pc[p.name] = SB.measRows[0].indexOf(p.name); });
+  const m = L.parseMeasured(SB.measRows.slice(1), { rpmCol: 0, orderCol: 1, pointCols: pc });
+  const est = L.estimatePoly(SF, m, { interp: 'linear', antiRatio: 0.05, degree: 1 });
+  est.fits.forEach(ft => [800, 1900, 3000].forEach(r => {
+    const t = SB.trueForce(ft.order, r);
+    assert.ok(Math.abs(L.polyEval(ft.coef, r) / t - 1) < 0.03, `${ft.order}차 ${r}rpm`);
+  }));
+});
+test('(b) RPM 점이 계수보다 적으면 오류', () => {
+  const est = L.estimatePoly(SF, synth(() => 1, [1000, 2000], [1], 0), { ...OPT, degree: 2 });
+  assert.ok(!est.ok); assert.match(est.errors[0], /RPM 점이 2개/);
+});
+test('잔차: 계산 2 vs 계측 1 → RMS 1, dB 오차 20·log10(2) = 6.0206', () => {
+  const s = L.fitStats([{ use: true, calc: 2, meas: 1, order: 1 }, { use: false, calc: 9, meas: 1, order: 1 }], o => o.order + '차');
+  near(s[0].rms, 1); near(s[0].rmsDb, 20 * Math.log10(2), 1e-12); assert.equal(s[0].n, 1); assert.equal(s[1].key, '1차');
+});
+test('추정 엑셀 시트 4개 (조건·계수·비교·잔차)', () => {
+  const est = L.estimatePoly(SF, synth((k, r) => L.polyEval(TRUE_POLY[k], r), [1000, 1500, 2000], [1, 2], 0), { ...OPT, degree: 1 });
+  const sh = L.fitToSheets(est, { antiRatio: 0 });
+  assert.deepEqual(sh.map(x => x.name), ['추정조건', '다항식계수', '계산_vs_계측', '잔차']);
+  assert.equal(sh[2].rows.length, 1 + 3 * 2 * SF.points.length);
+});
+
 console.log('Python 교차 확인');
 test('python/rpm_response.py 가 같은 값을 냄', () => {
   let py;
@@ -196,6 +340,29 @@ test('python/rpm_response.py 가 같은 값을 냄', () => {
   const js = r.points.find(p => p.name === '예시_운전석바닥_진동').rows;
   assert.equal(py.length, js.length);
   js.forEach((row, i) => { near(py[i][0], row.rpm); near(py[i][py[i].length - 1], row.overall, 1e-6 * Math.max(1, row.overall)); });
+});
+
+test('python 가진력 추정(다항식·scale 고정)이 웹 로직과 같은 값', () => {
+  try { execFileSync('python3', ['--version']); } catch { console.log('       (python3 없음 — 건너뜀)'); return; }
+  const pts = SF.points.map(p => p.name);
+  const base = [path.join(ROOT, 'python', 'rpm_response.py'), path.join(ROOT, 'samples', '예시데이터_FRF.csv'), '--point', pts.join(','),
+    '--estimate', path.join(ROOT, 'samples', '예시데이터_계측응답.csv')];
+  const pc = {}; pts.forEach(n => { pc[n] = SB.measRows[0].indexOf(n); });
+  const m = L.parseMeasured(SB.measRows.slice(1), { rpmCol: 0, orderCol: 1, pointCols: pc });
+  const py = execFileSync('python3', base.concat(['--degree', '2']), { encoding: 'utf8' }).trim().split(/\r?\n/).slice(1).map(l => l.split(',').map(Number));
+  const js = L.estimatePoly(SF, m, { interp: 'linear', antiRatio: 0.05, degree: 2 });
+  assert.equal(py.length, js.fits.length);
+  js.fits.forEach((ft, i) => { near(py[i][0], ft.order); ft.coef.forEach((c, j) => near(py[i][j + 1] / c, 1, 1e-9)); });
+  const py2 = execFileSync('python3', base.concat(['--orders', '1,2,4', '--scales', '1,0.5,0.2', '--ref-order', '1']), { encoding: 'utf8' }).trim().split(/\r?\n/).slice(1).map(l => l.split(',').map(Number));
+  const js2 = L.estimateScaleFixed(SF, m, { interp: 'linear', antiRatio: 0.05, ratio: { 1: 1, 2: 0.5, 4: 0.2 }, ref: 1 });
+  assert.equal(py2.length, js2.rpms.length);
+  js2.rpms.forEach((r, i) => { near(py2[i][0], r); near(py2[i][1] / js2.refForce[i], 1, 1e-12); });
+});
+test('python scale factor + 기준 차수 가진력 하나 = 차수별 상수 계산과 같음', () => {
+  try { execFileSync('python3', ['--version']); } catch { return; }
+  const run = extra => execFileSync('python3', [path.join(ROOT, 'python', 'rpm_response.py'), path.join(ROOT, 'samples', '예시데이터_FRF.csv'),
+    '--point', '예시_운전석바닥_진동', '--orders', '1,2,4', '--rpm', '800', '3000', '200'].concat(extra), { encoding: 'utf8' });
+  assert.equal(run(['--scales', '1,0.5,0.2', '--ref-order', '1', '--forces', '120']), run(['--forces', '120,60,24']));
 });
 
 console.log(`\n${passed}개 통과${process.exitCode ? ' — 실패 있음' : ''}`);

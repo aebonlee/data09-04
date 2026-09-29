@@ -35,7 +35,7 @@ create table if not exists public.analysis_cases (
   rpm_start    numeric check (rpm_start >= 0),
   rpm_end      numeric check (rpm_end >= 0),
   rpm_step     numeric check (rpm_step > 0),
-  force_mode   text not null default 'const' check (force_mode in ('const', 'table')),  -- 차수별 상수 / RPM별 표
+  force_mode   text not null default 'const',                -- 차수별 상수 / RPM 연동 벡터 / RPM별 표 파일 (제약은 아래 1-1)
   force_unit   text not null default 'N',
   interp       text not null default 'linear' check (interp in ('linear', 'nearest', 'loglog')),  -- logic.js INTERP
   anti_ratio   numeric not null default 0.05 check (anti_ratio > 0 and anti_ratio < 1),         -- 반공진 경고 기준
@@ -46,6 +46,24 @@ create table if not exists public.analysis_cases (
   constraint analysis_cases_rpm_range check (rpm_start is null or rpm_end is null or rpm_end >= rpm_start)
 );
 create index if not exists analysis_cases_owner_idx on public.analysis_cases (owner_id, created_at desc);
+
+-- 1-1. 2026-09-29 수강생 추가 요청 — scale factor · RPM 연동 벡터 · 추정 방식
+--  이미 만든 표에도 붙도록 add column if not exists, 제약은 지우고 다시 건다(재실행 안전)
+alter table public.analysis_cases add column if not exists scale_on     boolean not null default false;  -- 차수별 scale factor 사용
+alter table public.analysis_cases add column if not exists ref_order    numeric;                         -- 기준 차수
+alter table public.analysis_cases add column if not exists force_vector jsonb not null default '[]'::jsonb; -- settings.vectorRows [{rpm, v:{차수: 값}}]
+alter table public.analysis_cases add column if not exists est_mode     text not null default 'each';   -- 추정 방식
+alter table public.analysis_cases add column if not exists poly_degree  int  not null default 1;        -- 다항식 차수
+alter table public.analysis_cases drop constraint if exists analysis_cases_force_mode_check;
+alter table public.analysis_cases add constraint analysis_cases_force_mode_check check (force_mode in ('const', 'vector', 'table'));
+alter table public.analysis_cases drop constraint if exists analysis_cases_ref_order_check;
+alter table public.analysis_cases add constraint analysis_cases_ref_order_check check (ref_order is null or ref_order > 0);
+alter table public.analysis_cases drop constraint if exists analysis_cases_force_vector_check;
+alter table public.analysis_cases add constraint analysis_cases_force_vector_check check (jsonb_typeof(force_vector) = 'array');
+alter table public.analysis_cases drop constraint if exists analysis_cases_est_mode_check;
+alter table public.analysis_cases add constraint analysis_cases_est_mode_check check (est_mode in ('each', 'scale', 'poly'));
+alter table public.analysis_cases drop constraint if exists analysis_cases_poly_degree_check;
+alter table public.analysis_cases add constraint analysis_cases_poly_degree_check check (poly_degree between 0 and 5);
 
 -- 불러온 파일 — 한 건에 종류별로 하나 (frfFile · forceFile · measFile)
 --  sheets 는 엑셀 시트 내용을 그대로 담는다({시트명: [[셀…]…]}). 파일이 커서
@@ -118,6 +136,11 @@ create table if not exists public.force_table_values (
   -- ⚠ 프런트에서 upsert 할 때 onConflict 를 'case_id,rpm,order_no' 로 반드시 지정할 것
   constraint force_table_values_key unique (case_id, rpm, order_no)
 );
+
+-- 차수별 scale factor (settings.orders[].scale) — 기준 차수 대비 비율로 쓴다
+alter table public.case_orders add column if not exists scale numeric;
+alter table public.case_orders drop constraint if exists case_orders_scale_check;
+alter table public.case_orders add constraint case_orders_scale_check check (scale is null or scale > 0);
 
 -- ----------------------------------------------------------------------------
 -- 2. 함수 — search_path 고정

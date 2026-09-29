@@ -22,6 +22,11 @@
     loglog: '로그 보간(주파수·크기 모두 로그)'
   };
   var MAX_RPM_POINTS = 20000;
+  var FORCE_MODES = {
+    const: '차수별 상수',
+    vector: 'RPM 연동 벡터(화면 입력·붙여넣기, RPM 사이 선형 보간)',
+    table: 'RPM별 가진력 표 파일(RPM 사이 선형 보간)'
+  };
 
   // ── 숫자 ──────────────────────────────────────────────────────
   function toNumber(v) {
@@ -394,6 +399,340 @@
     return { table: table, orders: orders };
   }
 
+  // ── 가진력 scale factor · RPM 연동 벡터 (2026-09-29 수강생 요청 1) ────────
+  /*
+   * 차수별 scale factor s_k 와 기준 차수 r 이 있으면
+   *   F_k(RPM) = (s_k / s_r) × F_r(RPM)
+   * 로 기준 차수 하나만 입력해 나머지 차수를 계산합니다. s_r = 1 이면 F_k = s_k × F_r 입니다.
+   */
+  /**
+   * scales: [{order, scale}] (화면 입력 그대로), orderNums: 검증된 차수 목록, ref: 기준 차수
+   * 반환: {ok, ratio:{차수: s_k/s_r}, factors:{차수: s_k}, ref}
+   */
+  function scaleRatios(scales, orderNums, ref) {
+    var errs = [], factors = {}, r = toNumber(ref);
+    (scales || []).forEach(function (o) {
+      var k = toNumber(o.order);
+      if (isNaN(k) || orderNums.indexOf(k) < 0) return;
+      var s = toNumber(o.scale);
+      if (isNaN(s) || s <= 0) errs.push('차수 ' + k + '의 scale factor 를 0보다 큰 숫자로 입력해 주십시오.');
+      else factors[k] = s;
+    });
+    if (isNaN(r)) errs.push('기준 차수를 골라 주십시오.');
+    else if (orderNums.indexOf(r) < 0) errs.push('기준 차수 ' + r + '가 차수 목록에 없습니다.');
+    orderNums.forEach(function (k) { if (factors[k] == null && !errs.some(function (e) { return e.indexOf('차수 ' + k + '의') === 0; })) errs.push('차수 ' + k + '의 scale factor 를 입력해 주십시오.'); });
+    if (errs.length) return { ok: false, errors: errs };
+    var ratio = {};
+    orderNums.forEach(function (k) { ratio[k] = factors[k] / factors[r]; });
+    return { ok: true, ratio: ratio, factors: factors, ref: r };
+  }
+
+  /** 차수별 상수 모드 + scale: 기준 차수 가진력 하나로 나머지를 채운 orders 반환 */
+  function constForcesByScale(orderNums, ratio, refForce) {
+    var F = toNumber(refForce);
+    if (isNaN(F) || F < 0) return { ok: false, errors: ['기준 차수의 가진력을 0 이상의 숫자로 입력해 주십시오.'] };
+    return { ok: true, orders: orderNums.map(function (k) { return { order: k, force: ratio[k] * F }; }) };
+  }
+
+  /**
+   * 붙여넣은 글(엑셀에서 복사한 탭 구분, 또는 쉼표·공백 구분)을 행 배열로 나눕니다.
+   * 숫자가 아닌 첫 줄(머리행)은 건너뜁니다.
+   */
+  function splitPasted(text) {
+    var out = [];
+    String(text || '').split(/\r?\n/).forEach(function (line) {
+      if (!line.trim()) return;
+      var cells = line.indexOf('\t') >= 0 ? line.split('\t') : line.trim().split(/\s*[,;]\s*|\s+/);
+      out.push(cells.map(function (c) { return c.trim(); }));
+    });
+    while (out.length && isNaN(toNumber(out[0][0]))) out.shift();
+    return out;
+  }
+
+  /**
+   * RPM 연동 가진력 벡터 읽기. rows: [[RPM, 값1, 값2, …]] (문자열이어도 됨), keys: 값 열에 대응하는 차수 목록
+   * 반환 table: {rpm:[오름차순], byOrder:{차수:[값…]}} — parseForceTable 과 같은 모양이라 forceAt 에 그대로 씁니다.
+   */
+  function parseForceVector(rows, keys) {
+    var errs = [], recs = [], seen = {};
+    (rows || []).forEach(function (r, i) {
+      var cells = Array.isArray(r) ? r : [r.rpm].concat(keys.map(function (k) { return r.v ? r.v[k] : ''; }));
+      var filled = cells.some(function (c) { return c !== '' && c != null; });
+      if (!filled) return; // 빈 줄
+      var rpm = toNumber(cells[0]);
+      if (isNaN(rpm) || rpm < 0) { errs.push((i + 1) + '번째 줄: RPM 을 0 이상의 숫자로 입력해 주십시오.'); return; }
+      if (seen[rpm]) { errs.push('RPM ' + rpm + '이 두 번 들어 있습니다.'); return; }
+      seen[rpm] = true;
+      var vals = keys.map(function (k, j) {
+        var v = toNumber(cells[j + 1]);
+        if (isNaN(v) || v < 0) { errs.push('RPM ' + rpm + ' · ' + k + '차: 가진력을 0 이상의 숫자로 입력해 주십시오.'); return null; }
+        return v;
+      });
+      recs.push({ rpm: rpm, v: vals });
+    });
+    if (!recs.length && !errs.length) errs.push('RPM별 가진력을 한 줄 이상 입력해 주십시오.');
+    if (errs.length) return { ok: false, errors: errs };
+    recs.sort(function (a, b) { return a.rpm - b.rpm; });
+    var table = { rpm: recs.map(function (r) { return r.rpm; }), byOrder: {} };
+    keys.forEach(function (k, j) { table.byOrder[k] = recs.map(function (r) { return r.v[j]; }); });
+    return { ok: true, table: table };
+  }
+
+  /** 기준 차수 열만 있는 표 → 모든 차수 열이 있는 표 (F_k = ratio_k × F_ref) */
+  function expandTableByScale(table, orderNums, ratio, ref) {
+    var base = table.byOrder[ref];
+    if (!base) return { ok: false, errors: ['기준 차수 ' + ref + '의 가진력 열이 없습니다.'] };
+    var out = { rpm: table.rpm.slice(), byOrder: {} };
+    orderNums.forEach(function (k) { out.byOrder[k] = base.map(function (v) { return v == null ? null : ratio[k] * v; }); });
+    return { ok: true, table: out };
+  }
+
+  // ── 최소제곱 (Householder QR) ────────────────────────────────────
+  /**
+   * min ‖A x − b‖₂ 를 QR 분해로 풉니다. 정규방정식(AᵀA)x = Aᵀb 보다 조건수가 제곱으로 커지지 않아 안정적입니다.
+   * 반환: {ok, x, rank_ok} — R 대각 원소가 가장 큰 값의 1e-10 배 이하이면 계수가 정해지지 않는 것으로 봅니다.
+   */
+  function lstsq(A, b) {
+    var m = A.length, n = m ? A[0].length : 0;
+    if (!n) return { ok: false, reason: 'empty' };
+    if (m < n) return { ok: false, reason: 'underdetermined' };
+    var R = A.map(function (r) { return r.slice(); }), y = b.slice(), i, j, c;
+    for (j = 0; j < n; j++) {
+      var norm = 0;
+      for (i = j; i < m; i++) norm += R[i][j] * R[i][j];
+      norm = Math.sqrt(norm);
+      if (norm === 0) continue;
+      var alpha = R[j][j] > 0 ? -norm : norm;
+      var v = [];
+      for (i = j; i < m; i++) v.push(R[i][j]);
+      v[0] -= alpha;
+      var vn = 0;
+      v.forEach(function (t) { vn += t * t; });
+      if (vn === 0) continue;
+      for (c = j; c < n; c++) {
+        var s = 0;
+        for (i = j; i < m; i++) s += v[i - j] * R[i][c];
+        s = 2 * s / vn;
+        for (i = j; i < m; i++) R[i][c] -= s * v[i - j];
+      }
+      var sy = 0;
+      for (i = j; i < m; i++) sy += v[i - j] * y[i];
+      sy = 2 * sy / vn;
+      for (i = j; i < m; i++) y[i] -= sy * v[i - j];
+    }
+    var maxd = 0;
+    for (j = 0; j < n; j++) maxd = Math.max(maxd, Math.abs(R[j][j]));
+    for (j = 0; j < n; j++) if (!(Math.abs(R[j][j]) > 1e-10 * maxd)) return { ok: false, reason: 'rank' };
+    var x = new Array(n);
+    for (j = n - 1; j >= 0; j--) {
+      var t = y[j];
+      for (c = j + 1; c < n; c++) t -= R[j][c] * x[c];
+      x[j] = t / R[j][j];
+    }
+    return { ok: true, x: x };
+  }
+
+  function polyEval(coef, x) {
+    var v = 0;
+    for (var j = coef.length - 1; j >= 0; j--) v = v * x + coef[j];
+    return v;
+  }
+
+  // ── 가진력 추정 — 계산/계측 오차 최소화 (2026-09-29 수강생 요청 2) ─────────
+  /*
+   * 관측 하나 = (RPM, 차수 k, 응답점 p): 계측 m = |계측값|, 계산 = |H_p(k·RPM/60)| × F_k(RPM)
+   * 크기 기준으로 맞춥니다. 이 도구의 FRF 표는 buildFrf 에서 이미 |H| 로 바뀌어 있고, 계측 표도
+   * RPM·차수별 크기(order tracking 결과)라 위상이 없습니다. 가진점이 하나인 가정에서는 |H·F| = |H|·|F| 라
+   * 크기만으로 모형이 정확합니다(기획서 11장).
+   */
+  function observations(frf, measured, opts) {
+    var byName = {};
+    frf.points.forEach(function (p) { byName[p.name] = { p: p, max: maxMag(p.mag) }; });
+    var ratio = toNumber(opts.antiRatio);
+    if (isNaN(ratio) || ratio < 0) ratio = 0;
+    var obs = [];
+    measured.rows.forEach(function (m) {
+      var f = excitationFreq(m.order, m.rpm);
+      measured.points.forEach(function (name) {
+        var ent = byName[name], meas = m.values[name];
+        var o = { rpm: m.rpm, order: m.order, point: name, f: f, h: null, meas: meas == null ? null : Math.abs(meas), anti: false, status: 'ok', use: false };
+        if (!ent) o.status = 'no_point';
+        else if (meas == null) o.status = 'no_meas';
+        else {
+          var h = interpolate(frf.freq, ent.p.mag, f, opts.interp);
+          if (h.status !== 'ok') o.status = h.status;
+          else if (!(h.value > 0)) { o.h = h.value; o.status = 'zero_frf'; }
+          else { o.h = h.value; o.anti = h.value < ratio * ent.max; o.use = !o.anti; }
+        }
+        obs.push(o);
+      });
+    });
+    return obs;
+  }
+
+  function uniqSorted(arr) {
+    var out = [];
+    arr.slice().sort(function (a, b) { return a - b; }).forEach(function (v) { if (!out.length || out[out.length - 1] !== v) out.push(v); });
+    return out;
+  }
+
+  /**
+   * 잔차 통계. obs 에 calc 가 채워져 있어야 합니다. 맞춤에 쓴 관측(use)만 셉니다.
+   *   RMS      = √( Σ (계산 − 계측)² / n )                  (응답 단위)
+   *   dB 오차  = 20·log10(계산 / 계측)   → RMS dB = √(Σ dB² / n), 최대 |dB|
+   */
+  function fitStats(obs, keyFn) {
+    var groups = {}, order = [];
+    function acc(key) {
+      if (!groups[key]) { groups[key] = { key: key, n: 0, se: 0, nDb: 0, sdb: 0, maxDb: 0 }; order.push(key); }
+      return groups[key];
+    }
+    obs.forEach(function (o) {
+      if (!o.use || o.calc == null) return;
+      [acc('전체'), keyFn ? acc(keyFn(o)) : null].forEach(function (g) {
+        if (!g) return;
+        var e = o.calc - o.meas;
+        g.n++; g.se += e * e;
+        if (o.calc > 0 && o.meas > 0) {
+          var d = 20 * Math.log10(o.calc / o.meas);
+          g.nDb++; g.sdb += d * d; if (Math.abs(d) > g.maxDb) g.maxDb = Math.abs(d);
+        }
+      });
+    });
+    return order.map(function (k) {
+      var g = groups[k];
+      return { key: k, n: g.n, rms: g.n ? Math.sqrt(g.se / g.n) : null, rmsDb: g.nDb ? Math.sqrt(g.sdb / g.nDb) : null, maxDb: g.nDb ? g.maxDb : null };
+    });
+  }
+
+  /**
+   * (a) scale factor 고정 — 기준 차수의 RPM별 크기 F_r(RPM) 를 RPM 점마다 최소제곱으로 구합니다.
+   *   a = |H_p(k·RPM/60)| × s_k/s_r,   F_r(RPM) = Σ a·m / Σ a²   (그 RPM 의 모든 차수·응답점 관측)
+   * opts: {interp, antiRatio, ratio:{차수: s_k/s_r}, ref}
+   */
+  function estimateScaleFixed(frf, measured, opts) {
+    var obs = observations(frf, measured, opts), errs = [];
+    uniqSorted(obs.map(function (o) { return o.order; })).forEach(function (k) {
+      if (opts.ratio[k] == null) errs.push('계측 표의 ' + k + '차에 scale factor 가 없습니다. 2. 계산 조건의 차수 목록에 ' + k + '차와 scale factor 를 넣어 주십시오.');
+    });
+    if (errs.length) return { ok: false, errors: errs };
+    var rpms = uniqSorted(obs.map(function (o) { return o.rpm; }));
+    var byRpm = {};
+    rpms.forEach(function (r) { byRpm[r] = { num: 0, den: 0, n: 0 }; });
+    obs.forEach(function (o) {
+      if (!o.use) return;
+      var a = o.h * opts.ratio[o.order], g = byRpm[o.rpm];
+      g.num += a * o.meas; g.den += a * a; g.n++;
+    });
+    var refForce = rpms.map(function (r) { var g = byRpm[r]; return g.den > 0 ? g.num / g.den : null; });
+    var fidx = {};
+    rpms.forEach(function (r, i) { fidx[r] = refForce[i]; });
+    obs.forEach(function (o) {
+      var F = fidx[o.rpm];
+      o.force = F == null ? null : opts.ratio[o.order] * F;
+      o.calc = o.h != null && o.force != null ? o.h * o.force : null;
+    });
+    var orders = uniqSorted(obs.map(function (o) { return o.order; }));
+    var table = { rpm: rpms.slice(), byOrder: {} };
+    orders.forEach(function (k) { table.byOrder[k] = refForce.map(function (F) { return F == null ? null : opts.ratio[k] * F; }); });
+    return {
+      ok: true, mode: 'scale', ref: opts.ref, ratio: opts.ratio, rpms: rpms, refForce: refForce,
+      used: rpms.map(function (r) { return byRpm[r].n; }), orders: orders, obs: obs, table: table,
+      stats: fitStats(obs, function (o) { return o.order + '차'; }), statsByPoint: fitStats(obs, function (o) { return o.point; })
+    };
+  }
+
+  /**
+   * (b) scale factor 미고정 — 차수마다 F_k(RPM) = c_0 + c_1·RPM + … + c_n·RPMⁿ 로 두고 계수를 구합니다.
+   *   계측 m ≈ |H_p| × Σ_j c_j·RPMʲ  →  선형 최소제곱 (차수끼리는 관측이 겹치지 않아 따로 풉니다)
+   * 조건수를 줄이려고 x = RPM / RPM_max 로 풀고 c_j = β_j / RPM_maxʲ 로 되돌립니다.
+   * opts: {interp, antiRatio, degree}
+   */
+  function estimatePoly(frf, measured, opts) {
+    var n = Math.round(toNumber(opts.degree));
+    if (isNaN(n) || n < 0 || n > 5) return { ok: false, errors: ['다항식 차수는 0~5 사이 정수로 입력해 주십시오.'] };
+    var obs = observations(frf, measured, opts), errs = [], fits = [];
+    var orders = uniqSorted(obs.map(function (o) { return o.order; }));
+    var xs = 0;
+    obs.forEach(function (o) { if (o.use) xs = Math.max(xs, Math.abs(o.rpm)); });
+    if (!(xs > 0)) xs = 1;
+    orders.forEach(function (k) {
+      var use = obs.filter(function (o) { return o.order === k && o.use; });
+      var distinct = uniqSorted(use.map(function (o) { return o.rpm; })).length;
+      if (distinct < n + 1) { errs.push(k + '차: 쓸 수 있는 RPM 점이 ' + distinct + '개라 ' + n + '차 다항식(계수 ' + (n + 1) + '개)을 정할 수 없습니다. 다항식 차수를 낮추거나 계측 RPM 을 늘려 주십시오.'); return; }
+      var A = use.map(function (o) { var x = o.rpm / xs, row = [], p = 1; for (var j = 0; j <= n; j++) { row.push(o.h * p); p *= x; } return row; });
+      var sol = lstsq(A, use.map(function (o) { return o.meas; }));
+      if (!sol.ok) { errs.push(k + '차: 계수가 하나로 정해지지 않습니다(관측이 부족하거나 한쪽에 몰림). 다항식 차수를 낮춰 주십시오.'); return; }
+      var coef = sol.x.map(function (b, j) { return b / Math.pow(xs, j); });
+      fits.push({ order: k, coef: coef, n: use.length, rpms: distinct });
+    });
+    if (errs.length) return { ok: false, errors: errs };
+    var byOrder = {};
+    fits.forEach(function (ft) { byOrder[ft.order] = ft; });
+    obs.forEach(function (o) {
+      o.force = polyEval(byOrder[o.order].coef, o.rpm);
+      o.calc = o.h != null ? o.h * o.force : null;
+    });
+    var rpms = uniqSorted(obs.map(function (o) { return o.rpm; }));
+    var table = { rpm: rpms.slice(), byOrder: {} };
+    orders.forEach(function (k) { table.byOrder[k] = rpms.map(function (r) { return polyEval(byOrder[k].coef, r); }); });
+    return {
+      ok: true, mode: 'poly', degree: n, fits: fits, rpms: rpms, orders: orders, obs: obs, table: table,
+      stats: fitStats(obs, function (o) { return o.order + '차'; }), statsByPoint: fitStats(obs, function (o) { return o.point; })
+    };
+  }
+
+  /** 다항식 계수 → 사람이 읽는 식 (예: F = 12 + 0.034·RPM − 1.2e-6·RPM²) */
+  function polyText(coef) {
+    var parts = [];
+    coef.forEach(function (c, j) {
+      var s = fmt(Math.abs(c), 6) + (j === 0 ? '' : j === 1 ? '·RPM' : '·RPM' + ['', '', '²', '³', '⁴', '⁵'][j]);
+      parts.push({ neg: c < 0, s: s });
+    });
+    return 'F = ' + parts.map(function (p, i) { return (i === 0 ? (p.neg ? '−' : '') : (p.neg ? ' − ' : ' + ')) + p.s; }).join('');
+  }
+
+  function fitToSheets(est, meta) {
+    var used = {};
+    var cond = [
+      ['항목', '값'],
+      ['자료', meta.sample ? '예시 데이터(가상) — 실제 계측·해석 결과가 아닙니다' : '사용자 파일'],
+      ['FRF 파일', meta.fileName || ''],
+      ['계측 파일', meta.measFile || ''],
+      ['계산 일시', meta.created || ''],
+      ['비교 기준', '크기 |FRF| × 가진력 vs |계측| (단일 가진점, 위상 없음)'],
+      ['FRF 보간', INTERP[meta.interp] || meta.interp],
+      ['반공진 경고 기준', '최대 |FRF| × ' + meta.antiRatio + ' 보다 작은 관측은 맞춤에서 뺌']
+    ];
+    var coefRows;
+    if (est.mode === 'scale') {
+      cond.push(['추정 방식', 'scale factor 고정 — 기준 ' + est.ref + '차의 RPM별 크기를 RPM 점마다 최소제곱'],
+        ['식', 'F_ref(RPM) = Σ a·m ÷ Σ a²,  a = |FRF| × s_k/s_ref'],
+        ['scale factor 비(s_k/s_ref)', est.orders.map(function (k) { return k + '차=' + fmt(est.ratio[k], 6); }).join(', ')]);
+      coefRows = [['RPM', '기준 ' + est.ref + '차 추정 가진력', '쓴 관측 수'].concat(est.orders.map(function (k) { return k + '차 가진력(=비×기준)'; }))];
+      est.rpms.forEach(function (r, i) { coefRows.push([r, est.refForce[i] == null ? '' : est.refForce[i], est.used[i]].concat(est.orders.map(function (k) { var v = est.table.byOrder[k][i]; return v == null ? '' : v; }))); });
+    } else {
+      cond.push(['추정 방식', '가진력 형태 지정 — 차수별 ' + est.degree + '차 다항식 F_k(RPM) = Σ c_j·RPMʲ'],
+        ['식', '계측 ≈ |FRF| × Σ c_j·RPMʲ 를 선형 최소제곱(Householder QR)으로 풂']);
+      coefRows = [['차수', '쓴 관측 수', 'RPM 점 수'].concat(Array.apply(null, Array(est.degree + 1)).map(function (_, j) { return 'c' + j + ' (RPM^' + j + ')'; })).concat(['식'])];
+      est.fits.forEach(function (ft) { coefRows.push([ft.order, ft.n, ft.rpms].concat(ft.coef).concat([polyText(ft.coef)])); });
+    }
+    var cmp = [['RPM', '차수', '응답점', '가진주파수(Hz)', '|FRF|', '추정 가진력', '계산 응답', '계측', '오차(계산−계측)', 'dB 오차', '맞춤에 씀', '비고']];
+    est.obs.forEach(function (o) {
+      var db = o.calc > 0 && o.meas > 0 ? 20 * Math.log10(o.calc / o.meas) : '';
+      cmp.push([o.rpm, o.order, o.point, round(o.f, 6), o.h == null ? '' : o.h, o.force == null ? '' : o.force, o.calc == null ? '' : o.calc, o.meas == null ? '' : o.meas,
+        o.calc != null && o.meas != null ? o.calc - o.meas : '', db, o.use ? '예' : '', o.anti ? '반공진 부근' : (o.status === 'ok' ? '' : (STATUS_TEXT[o.status] || o.status))]);
+    });
+    var st = [['구분', '관측 수', 'RMS 오차', 'RMS dB 오차', '최대 |dB| 오차']];
+    est.stats.concat(est.statsByPoint.slice(1)).forEach(function (g) { st.push([g.key, g.n, g.rms == null ? '' : g.rms, g.rmsDb == null ? '' : g.rmsDb, g.maxDb == null ? '' : g.maxDb]); });
+    return [
+      { name: sheetName('추정조건', used), rows: cond },
+      { name: sheetName(est.mode === 'scale' ? '기준차수_RPM별가진력' : '다항식계수', used), rows: coefRows },
+      { name: sheetName('계산_vs_계측', used), rows: cmp },
+      { name: sheetName('잔차', used), rows: st }
+    ];
+  }
+
   // ── 엑셀 시트 ─────────────────────────────────────────────────
   function sheetName(s, used) {
     var base = String(s).replace(/[\\\/\?\*\[\]:]/g, '_').slice(0, 31) || 'Sheet';
@@ -416,10 +755,11 @@
       ['FRF 보간', INTERP[meta.interp] || meta.interp],
       ['차수 성분', '|FRF(가진 주파수)| × 가진력'],
       ['overall', 'RSS = √(Σ 차수 성분²)'],
-      ['가진력 입력', meta.forceMode === 'table' ? 'RPM별 가진력 표(RPM 사이 선형 보간)' : '차수별 상수'],
+      ['가진력 입력', FORCE_MODES[meta.forceMode] || meta.forceMode],
       ['가진력 단위', meta.forceUnit || ''],
-      ['차수', orders.map(function (o) { return orderLabel(o.order) + (meta.forceMode === 'table' ? '' : '=' + o.force); }).join(', ')]
+      ['차수', orders.map(function (o) { return orderLabel(o.order) + (meta.forceMode === 'const' ? '=' + o.force : ''); }).join(', ')]
     ];
+    if (meta.scale) cond.push(['scale factor', '기준 ' + meta.scale.ref + '차, ' + orders.map(function (o) { return orderLabel(o.order) + '=' + meta.scale.factors[o.order]; }).join(', ') + ' — F_k = (s_k / s_기준) × F_기준']);
     sheets.push({ name: sheetName('계산조건', used), rows: cond });
     result.points.forEach(function (p) {
       var head = ['RPM'];
@@ -510,7 +850,11 @@
     parseForceTable: parseForceTable, forceAt: forceAt, rss: rss, computeResponse: computeResponse,
     parseMeasured: parseMeasured, estimateForce: estimateForce, estimateToForceTable: estimateToForceTable,
     resultToSheets: resultToSheets, estimateToSheets: estimateToSheets, sheetName: sheetName, toCsv: toCsv,
-    niceTicks: niceTicks, fmt: fmt
+    niceTicks: niceTicks, fmt: fmt,
+    FORCE_MODES: FORCE_MODES, scaleRatios: scaleRatios, constForcesByScale: constForcesByScale, splitPasted: splitPasted,
+    parseForceVector: parseForceVector, expandTableByScale: expandTableByScale, lstsq: lstsq, polyEval: polyEval,
+    observations: observations, fitStats: fitStats, estimateScaleFixed: estimateScaleFixed, estimatePoly: estimatePoly,
+    polyText: polyText, fitToSheets: fitToSheets
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.FRFLogic = api;

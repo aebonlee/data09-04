@@ -69,7 +69,10 @@
       units: POINTS.reduce(function (o, p) { o[p.name] = p.unit; return o; }, {}),
       settings: {
         rpmStart: 800, rpmEnd: 3000, rpmStep: 50,
-        orders: ORDERS.map(function (k) { return { order: k, force: BASE_FORCE[k] }; }),
+        // scale factor 는 가상 기준 가진력 비(120 : 60 : 25)를 1차 = 1 로 적은 값
+        orders: ORDERS.map(function (k) { return { order: k, force: BASE_FORCE[k], scale: r6(BASE_FORCE[k] / BASE_FORCE[1]) }; }),
+        refOrder: 1, vectorStep: 200,
+        vectorRows: forceRows.slice(1).map(function (row) { var v = {}; ORDERS.forEach(function (k, j) { v[k] = row[j + 1]; }); return { rpm: row[0], v: v }; }),
         forceMode: 'const', forceUnit: 'N', interp: 'linear', antiRatio: 0.05
       },
       trueForce: trueForce

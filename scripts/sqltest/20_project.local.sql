@@ -63,7 +63,35 @@ begin
   v_raised := false;
   begin insert into public.analysis_cases (title, force_mode) values ('X', 'file');
   exception when check_violation then v_raised := true; end;
-  perform public._assert(v_raised, '가진력 입력은 const·table 만 (CHECK)');
+  perform public._assert(v_raised, '가진력 입력은 const·vector·table 만 (CHECK)');
+
+  -- 2026-09-29 — RPM 연동 벡터 · scale factor · 추정 방식
+  insert into public.analysis_cases (title, force_mode, scale_on, ref_order, force_vector, est_mode, poly_degree)
+  values ('벡터', 'vector', true, 2, '[{"rpm": 800, "v": {"2": 60}}]', 'poly', 3);
+  insert into public.case_orders (case_id, order_no, scale)
+  select id, 3, 0.2 from public.analysis_cases where title = '벡터';
+
+  v_raised := false;
+  begin insert into public.analysis_cases (title, est_mode) values ('X', 'nn');
+  exception when check_violation then v_raised := true; end;
+  perform public._assert(v_raised, '추정 방식은 each·scale·poly 만 (CHECK)');
+
+  v_raised := false;
+  begin insert into public.analysis_cases (title, poly_degree) values ('X', 6);
+  exception when check_violation then v_raised := true; end;
+  perform public._assert(v_raised, '다항식 차수는 0~5 (CHECK)');
+
+  v_raised := false;
+  begin insert into public.analysis_cases (title, force_vector) values ('X', '{"rpm": 1}');
+  exception when check_violation then v_raised := true; end;
+  perform public._assert(v_raised, 'RPM 연동 벡터는 배열 (CHECK)');
+
+  v_raised := false;
+  begin insert into public.case_orders (case_id, order_no, scale) values (v_case, 5, 0);
+  exception when check_violation then v_raised := true; end;
+  perform public._assert(v_raised, 'scale factor 는 0 보다 커야 한다 (CHECK)');
+  perform public._assert_eq((select scale from public.case_orders where order_no = 3), 0.2::numeric, 'scale factor 가 저장된다');
+  delete from public.analysis_cases where title = '벡터';   -- 아래 개수 검증에 섞이지 않게 (차수 행은 cascade)
 
   v_raised := false;
   begin insert into public.analysis_cases (title, rpm_start, rpm_end) values ('X', 3000, 1000);
