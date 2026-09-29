@@ -395,7 +395,9 @@
     headers.forEach(function (h, i) {
       if (i === rpmCol) return;
       var m = String(h).match(/(\d+(?:\.\d+)?)\s*(차|order|ord|x\b)/i) || String(h).match(/^\s*(\d+(?:\.\d+)?)\s*$/);
-      if (m) orderCols.push({ order: +m[1], col: i });
+      if (m) { orderCols.push({ order: +m[1], col: i }); return; }
+      var s2 = L.splitMeasHeader(h, []); // 1st · 2X · H1 · order 1 등 (2026-09-29 저녁 머리행 규칙)
+      if (s2.ok && typeof s2.order === 'number') orderCols.push({ order: s2.order, col: i });
     });
     return { rpmCol: rpmCol, orderCols: orderCols };
   }
@@ -734,7 +736,8 @@
     var sheetHits = names.filter(function (n) { return f.sheetNames.some(function (sn) { return sn === L.sheetName(n, {}) || sn === n; }); });
     var format = orderCol >= 0 ? 'long' : sheetHits.length ? 'sheets' : 'wide';
     // 가로 형식 기본값: 머리행 이름으로 응답점·차수를 찾고, 없으면 첫 응답점 · 계산 조건의 차수
-    var auto = L.measMapByHeader(headers, names, rpmCol), pts = [];
+    // 머리행 규칙(2026-09-29 저녁): 지점 이름은 파일 그대로(FRF 응답점 이름과 같아야 짝), 차수는 1차·1·1st·1X·H1·order 1 등
+    var auto = L.measMapByHeader(headers, names, rpmCol, { defaultPoint: null }), pts = [];
     auto.forEach(function (c) { if (pts.indexOf(c.point) < 0) pts.push(c.point); });
     var single = pts.length ? auto : L.measMapByHeader(headers, names.slice(0, 1), rpmCol);
     var ords = [];
@@ -742,25 +745,36 @@
     var overall = single.length && single.every(function (c) { return c.order === 'overall'; });
     var wide = {
       kind: overall ? 'overall' : 'order', points: pts.length ? pts : names.slice(0, 1), layout: single.length ? 'auto' : 'order',
-      ordersText: (ords.length ? ords.sort(function (a, b) { return a - b; }) : validOrderNumbers()).join(', '), startCol: rpmCol + 1
+      ordersText: (ords.length ? ords.sort(function (a, b) { return a - b; }) : validOrderNumbers()).join(', '), startCol: rpmCol + 1,
+      alias: {}, overrides: {}
     };
     var bind = {};
     names.forEach(function (n) { bind[n] = f.sheetNames.filter(function (sn) { return sn === L.sheetName(n, {}) || sn === n; })[0] || ''; });
     return {
       format: format, rpmCol: rpmCol, orderCol: orderCol < 0 ? (rpmCol === 0 ? 1 : 0) : orderCol, pointCols: pointCols, wide: wide,
-      sheets: { bind: bind, rpmCol: 0, startCol: 1, kind: wide.kind, ordersText: wide.ordersText, layout: 'auto' }
+      sheets: { bind: bind, rpmCol: 0, startCol: 1, kind: wide.kind, ordersText: wide.ordersText, layout: 'auto', overrides: {} }
     };
   }
-  function wideColMap(headers, rpmCol, w, points) {
+  /**
+   * 가로 형식 열 배정. 자동(머리행 이름)이면 L.analyzeMeasHeaders 로 열마다 인식 결과(analysis)도 돌려줍니다 — 「열 배정 확인」 표의 재료.
+   * fixedPoint: 지점별 시트(시트 ↔ 응답점 짝이 정해짐). w.alias: 파일의 지점 이름 → FRF 응답점, w.overrides: 열별 직접 지정
+   */
+  function wideColMap(headers, rpmCol, w, points, fixedPoint, overrides) {
     var orders = w.kind === 'overall' ? ['overall'] : ordersOf(w.ordersText);
-    if (w.layout === 'auto') return { map: L.measMapByHeader(headers, points, rpmCol).filter(function (c) { return w.kind === 'overall' ? c.order === 'overall' : orders.indexOf(c.order) >= 0; }), need: 0 };
+    if (w.layout === 'auto') {
+      var an = L.analyzeMeasHeaders(headers, { rpmCol: rpmCol, points: frfNames(), defaultPoint: fixedPoint ? null : points[0] || null, fixedPoint: fixedPoint || null,
+        alias: w.alias || {}, kind: w.kind, orders: w.kind === 'overall' ? null : orders, overrides: overrides || w.overrides || {} });
+      return { map: an.filter(function (e) { return e.status === 'ok'; }).map(function (e) { return { col: e.col, point: e.point, order: e.order }; }), need: 0, analysis: an };
+    }
     var m = L.measLayoutMap(+w.startCol, points, orders, w.layout === 'pos' ? 'order' : w.layout);
     return { map: m.filter(function (c) { return c.col < headers.length; }), need: m.length ? m[m.length - 1].col + 1 : 0 };
   }
   function sheetPart(f, sheet, point, sh) {
     var rows = f.sheets[sheet] || [], hr = L.guessHeaderRow(rows), headers = rows[hr] || [];
-    var cm = wideColMap(headers, +sh.rpmCol, { kind: sh.kind, ordersText: sh.ordersText, layout: sh.layout === 'auto' ? 'auto' : 'order', startCol: sh.startCol }, [point]);
-    return { rows: rows.slice(hr + 1), rpmCol: +sh.rpmCol, colMap: cm.map, need: cm.need, width: headers.length, sheet: sheet, headers: headers };
+    if (!sh.overrides) sh.overrides = {};
+    if (!sh.overrides[sheet]) sh.overrides[sheet] = {};
+    var cm = wideColMap(headers, +sh.rpmCol, { kind: sh.kind, ordersText: sh.ordersText, layout: sh.layout === 'auto' ? 'auto' : 'order', startCol: sh.startCol }, [point], point, sh.overrides[sheet]);
+    return { rows: rows.slice(hr + 1), rpmCol: +sh.rpmCol, colMap: cm.map, need: cm.need, width: headers.length, sheet: sheet, headers: headers, analysis: cm.analysis, overrides: sh.overrides[sheet] };
   }
   /** 화면의 형식·배정대로 계측 표를 읽습니다 → L.parseMeasured / L.parseMeasTable 결과 */
   function buildMeasured() {
@@ -782,11 +796,48 @@
     if (!parts.length) errs.push('응답점마다 계측 시트를 하나 이상 골라 주십시오.');
     return errs.length ? { ok: false, errors: errs } : L.parseMeasTable(parts);
   }
+  /** 열 배정 확인 표. rows: [{where, header, recog, point(글자|DOM), order(글자|DOM), state, cls}] */
   function mapPreview(rows) {
     return el('div', { class: 'table-wrap tall', style: 'margin-top:10px' }, el('table', { class: 'grid map', id: 'measMapTable' },
-      el('thead', null, el('tr', null, el('th', null, '시트·열'), el('th', null, '머리행'), el('th', null, '응답점'), el('th', null, '차수'))),
-      el('tbody', null, rows.length ? rows.map(function (r) { return el('tr', null, el('td', null, r[0]), el('td', null, r[1]), el('td', null, r[2]), el('td', null, r[3])); })
-        : el('tr', null, el('td', { colspan: '4', class: 'text' }, '배정된 열이 없습니다. 응답점·차수·열 배치를 확인해 주십시오.')))));
+      el('thead', null, el('tr', null, el('th', null, '시트·열'), el('th', null, '머리행 (파일 그대로)'), el('th', null, '읽은 표기'), el('th', null, '응답점'), el('th', null, '차수'), el('th', null, '상태'))),
+      el('tbody', null, rows.length ? rows.map(function (r) { return el('tr', { class: r.cls || null }, el('td', null, r.where), el('td', { class: 'text' }, r.header), el('td', { class: 'text' }, r.recog), el('td', { class: 'text' }, r.point), el('td', null, r.order), el('td', { class: 'text' }, r.state)); })
+        : el('tr', null, el('td', { colspan: '6', class: 'text' }, '배정된 열이 없습니다. 응답점·차수·열 배치를 확인해 주십시오.')))));
+  }
+  var STATE_TEXT = { ok: '씀', order: '인식 못함 — 쓰지 않음', point: '응답점 짝 없음 — 쓰지 않음', filtered: '쓰지 않음', skip: '직접 뺌' };
+  /** 자동 배정 한 열 → 표 한 줄. 차수·응답점은 고를 수 있음(직접 지정). */
+  function analysisRow(where, e, ov, orderOpts, pointSel, reset) {
+    var cur = ov[e.col] || {};
+    var ordSel = el('select', { class: 'cell-input', name: 'measColOrder', 'aria-label': where + ' 차수', style: 'width:auto', onchange: function () {
+      var o = ov[e.col] || (ov[e.col] = {}); o.order = this.value; if (!o.order && !o.point) delete ov[e.col]; reset(); render(); } },
+      [['', '자동' + (e.auto != null ? ' (' + L.orderText(e.auto) + ')' : ' (인식 못함)')], ['skip', '쓰지 않음']].concat(orderOpts).map(function (o) { return el('option', { value: o[0], selected: String(cur.order || '') === o[0] }, o[1]); }));
+    var pt = pointSel ? el('select', { class: 'cell-input', name: 'measColPoint', 'aria-label': where + ' 응답점', style: 'width:auto', onchange: function () {
+      var o = ov[e.col] || (ov[e.col] = {}); o.point = this.value; if (!o.order && !o.point) delete ov[e.col]; reset(); render(); } },
+      [el('option', { value: '' }, '자동' + (e.point && !cur.point ? ' (' + e.point + ')' : ''))].concat(frfNames().map(function (n) { return el('option', { value: n, selected: cur.point === n }, n); }))) : (e.point || '—');
+    var recog = e.auto == null ? '—' : (e.label || e.header) + ' → ' + L.orderText(e.auto) + (e.form ? ' (' + L.ORDER_FORMS[e.form] + ')' : '');
+    if (e.pointText) recog = '지점 「' + e.pointText + '」 · ' + recog;
+    var state = (STATE_TEXT[e.status] || e.status) + (e.reason && e.status !== 'ok' ? ': ' + e.reason : '') + (e.overridden && e.status === 'ok' ? ' (직접 지정)' : '');
+    return { where: where, header: e.header, recog: recog, point: pt, order: ordSel, state: state, use: e.status === 'ok', cls: e.status === 'order' || e.status === 'point' ? 'partial' : e.status === 'ok' ? null : 'muted' };
+  }
+  function analysisSummary(an) {
+    var ok = an.filter(function (e) { return e.status === 'ok'; }).length, bad = an.filter(function (e) { return e.status === 'order' || e.status === 'point'; });
+    if (!bad.length) return el('p', { class: 'note', id: 'measHeaderSummary' }, '머리행 ' + an.length + '개 가운데 ' + ok + '개를 계산에 씁니다. 계산 전에 아래 표에서 읽은 차수·응답점을 확인해 주십시오.');
+    return el('div', { class: 'alert warn', id: 'measHeaderSummary' }, '머리행 ' + an.length + '개 가운데 ' + bad.length + '개를 알아보지 못해 계산에 쓰지 않습니다(추측하지 않음): ',
+      bad.map(function (e) { return '「' + e.header + '」'; }).join(', '),
+      '. 써야 하는 열이면 표의 차수·응답점을 직접 골라 주십시오. 인식하는 차수 표기: 1차 · 1 · 1st · 1X · H1 · order 1 · Ord1 (전각·대소문자 무관).');
+  }
+  /** 직접 지정 차수 목록: 차수 목록 + 머리행에서 읽은 차수 (+ overall) */
+  function orderOptions(w, an) {
+    var ks = w.kind === 'overall' ? [] : ordersOf(w.ordersText);
+    an.forEach(function (e) { if (typeof e.order === 'number' && ks.indexOf(e.order) < 0) ks.push(e.order); });
+    ks.sort(function (a, b) { return a - b; });
+    return ks.map(function (k) { return [String(k), k + '차']; }).concat([['overall', 'overall']]);
+  }
+  /** 위치 배정 한 열 → 표 한 줄. 머리행이 말하는 차수와 위치 배정이 다르면 알림 */
+  function posRow(where, header, c) {
+    var h = String(header == null ? '' : header), s = L.splitMeasHeader(h, frfNames());
+    var clash = s.ok && (s.order !== c.order || (s.pointText && s.pointText !== c.point));
+    return { where: where, header: h, recog: s.ok ? (s.pointText ? '지점 「' + s.pointText + '」 · ' : '') + L.orderText(s.order) : '—', point: c.point, order: L.orderText(c.order),
+      state: clash ? '씀 — 그런데 머리행이 말하는 차수·지점과 위치 배정이 다릅니다. 열 배치를 확인해 주십시오' : '씀 (위치 배정)', use: true, cls: clash ? 'partial' : null };
   }
   function measFormatBlock(f, mm, reset) {
     var info = fileRowsInfo(f), names = frfNames(), box = el('div');
@@ -809,8 +860,8 @@
     var kindRow = radioGroup('measKind', '값 종류', [['order', '차수별 응답'], ['overall', 'overall 만 (차수 정의 없음)']], w.kind, function (v) { w.kind = v; reset(); render(); });
     var ordIn = el('input', { name: 'measOrders', value: w.ordersText || '', placeholder: '예: 1, 2, 4', oninput: function () { w.ordersText = this.value; reset(); }, onchange: function () { render(); } });
     var layoutOpts = mm.format === 'wide'
-      ? [['auto', '머리행 이름으로 자동 (지점이름_n차)'], ['order', '차수 우선 (지점1_차수1, 지점2_차수1, …)'], ['point', '지점 우선 (지점1_차수1, 지점1_차수2, …)']]
-      : [['auto', '머리행 이름으로 자동 (n차 · overall)'], ['pos', '위치로 (시작 열부터 차수 순서)']];
+      ? [['auto', '머리행 이름으로 자동 (지점이름_1차 · _1st · _1X · _H1 · _order 1)'], ['order', '차수 우선 (지점1_차수1, 지점2_차수1, …)'], ['point', '지점 우선 (지점1_차수1, 지점1_차수2, …)']]
+      : [['auto', '머리행 이름으로 자동 (1차 · 1 · 1st · 1X · H1 · overall)'], ['pos', '위치로 (시작 열부터 차수 순서)']];
     var layoutRow = radioGroup('measLayout', '열 배치', layoutOpts, w.layout, function (v) { w.layout = v; reset(); render(); });
     var grid = el('div', { class: 'form-grid', style: 'margin-top:12px' });
     var headersForSel = mm.format === 'wide' ? info.headers : (function () { var sn = names.map(function (n) { return mm.sheets.bind[n]; }).filter(Boolean)[0]; var rows = sn ? f.sheets[sn] || [] : []; return rows[L.guessHeaderRow(rows)] || []; })();
@@ -824,16 +875,44 @@
     box.appendChild(el('h3', { style: 'margin-top:14px' }, '값 종류')); box.appendChild(kindRow);
     box.appendChild(el('h3', { style: 'margin-top:14px' }, '열 배치')); box.appendChild(layoutRow);
     box.appendChild(grid);
-    var preview = [];
+    var preview = [], summary = null, allAn = [];
     if (mm.format === 'wide') {
       var pts = w.points;
-      box.appendChild(el('h3', { style: 'margin-top:14px' }, '계측 지점 (FRF 응답점과 짝, ' + (w.layout === 'auto' ? '이름으로 찾음' : '열 순서대로') + ')'));
-      box.appendChild(el('div', { class: 'btn-row' }, pts.map(function (n, i) {
-        var sel = el('select', { class: 'cell-input', name: 'measPoint', 'aria-label': (i + 1) + '번째 계측 지점', style: 'width:auto', onchange: function () { pts[i] = this.value; reset(); render(); } },
-          names.map(function (m) { return el('option', { value: m, selected: m === n }, (i + 1) + '. ' + m); }));
-        return el('span', { class: 'btn-row' }, sel, el('button', { type: 'button', class: 'btn btn-small btn-danger', onclick: function () { pts.splice(i, 1); reset(); render(); } }, '빼기'));
-      }), el('button', { type: 'button', class: 'btn btn-small', onclick: function () { var next = names.filter(function (m) { return pts.indexOf(m) < 0; })[0]; if (next) { pts.push(next); reset(); render(); } } }, '지점 추가')));
-      wideColMap(info.headers, mm.rpmCol, w, pts).map.forEach(function (c) { preview.push([colLetter(c.col), String(info.headers[c.col] == null ? '' : info.headers[c.col]), c.point, c.order === 'overall' ? 'overall' : c.order + '차']); });
+      if (w.layout === 'auto') {
+        if (!pts.length) pts.push(names[0]);
+        box.appendChild(el('h3', { style: 'margin-top:14px' }, '지점 이름이 없는 열(RPM, 1차, 2차 …)의 응답점'));
+        box.appendChild(el('select', { class: 'cell-input', name: 'measPoint', 'aria-label': '지점 이름이 없는 열의 응답점', style: 'width:auto', onchange: function () { pts[0] = this.value; reset(); render(); } },
+          names.map(function (m) { return el('option', { value: m, selected: m === pts[0] }, m); })));
+        box.appendChild(el('p', { class: 'note' }, '머리행에 지점 이름이 있으면(지점이름_1차) 그 이름을 파일 그대로 FRF 응답점 이름과 맞춥니다. 이름이 다르면 아래 「지점 이름 짝」에서 골라 주십시오.'));
+      } else {
+        box.appendChild(el('h3', { style: 'margin-top:14px' }, '계측 지점 (FRF 응답점과 짝, 열 순서대로)'));
+        box.appendChild(el('div', { class: 'btn-row' }, pts.map(function (n, i) {
+          var sel = el('select', { class: 'cell-input', name: 'measPoint', 'aria-label': (i + 1) + '번째 계측 지점', style: 'width:auto', onchange: function () { pts[i] = this.value; reset(); render(); } },
+            names.map(function (m) { return el('option', { value: m, selected: m === n }, (i + 1) + '. ' + m); }));
+          return el('span', { class: 'btn-row' }, sel, el('button', { type: 'button', class: 'btn btn-small btn-danger', onclick: function () { pts.splice(i, 1); reset(); render(); } }, '빼기'));
+        }), el('button', { type: 'button', class: 'btn btn-small', onclick: function () { var next = names.filter(function (m) { return pts.indexOf(m) < 0; })[0]; if (next) { pts.push(next); reset(); render(); } } }, '지점 추가')));
+      }
+      var wcm = wideColMap(info.headers, mm.rpmCol, w, pts);
+      if (wcm.analysis) {
+        if (!w.overrides) w.overrides = {};
+        if (!w.alias) w.alias = {};
+        // 파일의 지점 이름 ↔ FRF 응답점 짝 — 이름이 다를 때만(이름은 파일 그대로 두고 짝만 지음)
+        var texts = [];
+        wcm.analysis.forEach(function (e) { if (e.pointText && (names.indexOf(e.pointText) < 0 || w.alias[e.pointText]) && texts.indexOf(e.pointText) < 0) texts.push(e.pointText); });
+        if (texts.length) {
+          box.appendChild(el('h3', { style: 'margin-top:14px' }, '지점 이름 짝 (파일 이름 그대로 → FRF 응답점)'));
+          box.appendChild(el('div', { class: 'table-wrap' }, el('table', { class: 'grid map', id: 'measAliasTable' },
+            el('thead', null, el('tr', null, el('th', null, '파일의 지점 이름'), el('th', null, 'FRF 응답점'))),
+            el('tbody', null, texts.map(function (t) {
+              var sel = el('select', { class: 'cell-input', name: 'measAlias', 'aria-label': t + ' 짝', onchange: function () { if (this.value) w.alias[t] = this.value; else delete w.alias[t]; reset(); render(); } },
+                [el('option', { value: '' }, '(짝 없음 — 쓰지 않음)')].concat(names.map(function (n) { return el('option', { value: n, selected: w.alias[t] === n }, n); })));
+              return el('tr', null, el('td', { class: 'text' }, t), el('td', null, sel));
+            })))));
+        }
+        summary = analysisSummary(wcm.analysis);
+        var oo = orderOptions(w, wcm.analysis);
+        wcm.analysis.forEach(function (e) { preview.push(analysisRow(colLetter(e.col), e, w.overrides, oo, true, reset)); });
+      } else wcm.map.forEach(function (c) { preview.push(posRow(colLetter(c.col), info.headers[c.col], c)); });
     } else {
       box.appendChild(el('h3', { style: 'margin-top:14px' }, '응답점별 시트'));
       box.appendChild(el('div', { class: 'table-wrap' }, el('table', { class: 'grid map' },
@@ -847,10 +926,17 @@
         var sn = mm.sheets.bind[n];
         if (!sn) return;
         var p = sheetPart(f, sn, n, mm.sheets);
-        p.colMap.forEach(function (c) { preview.push([sn + ' · ' + colLetter(c.col), String(p.headers[c.col] == null ? '' : p.headers[c.col]), c.point, c.order === 'overall' ? 'overall' : c.order + '차']); });
+        if (p.analysis) {
+          allAn = allAn.concat(p.analysis);
+          var oo2 = orderOptions(w, p.analysis);
+          p.analysis.forEach(function (e) { preview.push(analysisRow(sn + ' · ' + colLetter(e.col), e, p.overrides, oo2, false, reset)); });
+        } else p.colMap.forEach(function (c) { preview.push(posRow(sn + ' · ' + colLetter(c.col), p.headers[c.col], c)); });
       });
+      if (mm.sheets.layout === 'auto') summary = analysisSummary(allAn);
     }
-    box.appendChild(el('h3', { style: 'margin-top:14px' }, '열 배정 확인 (' + preview.length + '열)'));
+    var used = preview.filter(function (r) { return r.use; }).length;
+    box.appendChild(el('h3', { style: 'margin-top:14px' }, '열 배정 확인 (계산에 쓰는 열 ' + used + ' / ' + preview.length + ')'));
+    if (summary) box.appendChild(summary);
     box.appendChild(mapPreview(preview));
     return box;
   }
@@ -1048,7 +1134,7 @@
           el('li', null, '(b) 는 RPM 을 최댓값으로 나눠 풀고 계수를 되돌립니다. 정규방정식(AᵀA)을 직접 풀면 3차 이상에서 오차가 커지기 쉬워 QR 분해를 씁니다.'),
           el('li', null, '검증: 알려진 가진력으로 만든 합성 계측(노이즈 없음)에서 추정값이 원래 값과 1e-9 이내로 같고, ±2% 노이즈에서 3% 이내임을 테스트로 확인합니다.')),
         el('h2', null, '계측 표 형식·overall 오차·오차 기준 (2026-09-29 오후 추가)'),
-        el('div', { class: 'formula' }, '계측 표 형식\n  차수별       RPM, 1차, 2차, …                     (한 지점)\n  overall      RPM, overall                          (차수 정의 없음)\n  여러 지점    차수 우선 RPM, 지점1_1차, 지점2_1차, …, 지점1_2차, …\n               지점 우선 RPM, 지점1_1차, 지점1_2차, …, 지점2_1차, …\n  지점별 시트  시트마다 RPM, 1차, 2차, … (또는 RPM, overall)\n  긴 형식      RPM, 차수, 응답점1, 응답점2, …\n\noverall 오차  계산 overall_p(RPM) = √( Σ_k ( |H_p(k·RPM/60)| × F_k(RPM) )² )\n  scale 고정  = F_기준 × √Σ_k(|H_pk| × s_k/s_기준)²  → F_기준 에 선형\n  다항식      F_k 계수에 비선형 → Levenberg–Marquardt\n  (F_k 의 부호는 overall 로 구분되지 않아 양수로 맞춤)\n\n오차 기준     평균값: min Σ e_i² / n   (최소제곱)\n              최대값: min max_i |e_i|  (minimax — Lawson 반복 재가중)\n              e_i = 계산_i − 계측_i  (상대오차면 ÷ 계측_i), i = 모든 계측 지점·RPM(·차수)'),
+        el('div', { class: 'formula' }, '계측 표 형식\n  차수별       RPM, 1차, 2차, …                     (한 지점)\n  overall      RPM, overall                          (차수 정의 없음)\n  여러 지점    차수 우선 RPM, 지점1_1차, 지점2_1차, …, 지점1_2차, …\n               지점 우선 RPM, 지점1_1차, 지점1_2차, …, 지점2_1차, …\n  지점별 시트  시트마다 RPM, 1차, 2차, … (또는 RPM, overall)\n  긴 형식      RPM, 차수, 응답점1, 응답점2, …\n\n머리행 규칙 (2026-09-29 저녁 확정)\n  지점 이름    파일에 있는 그대로 (FRF 응답점 이름과 같으면 짝, 다르면 「지점 이름 짝」에서 고름)\n  차수 표기    1차 · 차수1 (기본)  1 · 0.5 (숫자만, 200 이하)  1st · 2nd · 3rd · 4th · 1st order\n               1X · 1x  H1  order 1 · Ord1 · 2 order   전각 숫자(１차)·대소문자·공백 무관\n  overall      overall · OA · 전체 · 합성\n  모르는 표기  추측하지 않고 「인식 못함」으로 표시, 계산에서 뺌 (2st·11st 처럼 서수가 틀려도)\n\noverall 오차  계산 overall_p(RPM) = √( Σ_k ( |H_p(k·RPM/60)| × F_k(RPM) )² )\n  scale 고정  = F_기준 × √Σ_k(|H_pk| × s_k/s_기준)²  → F_기준 에 선형\n  다항식      F_k 계수에 비선형 → Levenberg–Marquardt\n  (F_k 의 부호는 overall 로 구분되지 않아 양수로 맞춤)\n\n오차 기준     평균값: min Σ e_i² / n   (최소제곱)\n              최대값: min max_i |e_i|  (minimax — Lawson 반복 재가중)\n              e_i = 계산_i − 계측_i  (상대오차면 ÷ 계측_i), i = 모든 계측 지점·RPM(·차수)'),
         el('ul', null,
           el('li', null, '계측 지점이 하나여도 여럿이어도 같은 식입니다. 여럿이면 모든 지점의 오차를 한데 모아 평균 또는 최대를 줄입니다.'),
           el('li', null, 'overall 만으로도 차수별 가진력을 나눌 수 있는 것은 차수마다 가진 주파수가 달라 |FRF| 가 RPM 에 따라 다르게 변하기 때문입니다. 관측(지점 × RPM)이 계수 수(차수 × (n+1))보다 많아야 하고, 테스트에서 노이즈 없는 합성 overall 로 계수를 1e-7 이내로 복원함을 확인했습니다.'),

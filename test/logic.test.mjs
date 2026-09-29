@@ -375,6 +375,85 @@ test('overall 표: kind overall, 섞이면 오류, 중복 배정 오류', () => 
   assert.ok(!L.parseMeasTable([{ rows: [[1, 2, 3]], rpmCol: 0, colMap: [{ col: 1, point: 'A', order: 1 }, { col: 2, point: 'A', order: 1 }] }]).ok);
 });
 
+console.log('차수 표기 정규화 — 머리행 규칙 (2026-09-29 저녁 수강생 답변)');
+const PO = t => { const r = L.parseOrderLabel(t); return r.ok ? r.order : null; };
+test('기본 표기: 1차 · 2 차 · 3차수 · 차수4 · 차수_5 · 0.5차', () => {
+  assert.deepEqual(['1차', '2 차', '3차수', '차수4', '차수_5', '0.5차'].map(PO), [1, 2, 3, 4, 5, 0.5]);
+  assert.equal(L.parseOrderLabel('1차').form, 'kr');
+});
+test('숫자만: 1 · 2 · 0.5 (200 이하)', () => { assert.deepEqual(['1', '2', '0.5', '200'].map(PO), [1, 2, 0.5, 200]); assert.equal(L.parseOrderLabel('2').form, 'num'); });
+test('서수: 1st · 2nd · 3rd · 4th · 11th · 12th · 13th · 21st · 22nd · 1st order · 2nd-Order', () => {
+  assert.deepEqual(['1st', '2nd', '3rd', '4th', '11th', '12th', '13th', '21st', '22nd', '1st order', '2nd-Order'].map(PO), [1, 2, 3, 4, 11, 12, 13, 21, 22, 1, 2]);
+  assert.equal(L.parseOrderLabel('3rd').form, 'ordinal');
+});
+test('nX · Hn · order n · Ord n: 1X · 1x · 0.5X · H1 · h 2 · order 1 · Order_2 · Ord1 · ORD.3 · 2 order', () => {
+  assert.deepEqual(['1X', '1x', '0.5X', 'H1', 'h 2', 'order 1', 'Order_2', 'Ord1', 'ORD.3', '2 order'].map(PO), [1, 1, 0.5, 1, 2, 1, 2, 1, 3, 2]);
+  assert.deepEqual(['1X', 'H1', 'Ord1'].map(t => L.parseOrderLabel(t).form), ['x', 'h', 'order']);
+});
+test('전각 숫자·문자: １차 · ２ｎｄ · ＯＲＤＥＲ　３ · Ｈ４ · ３Ｘ', () => { assert.deepEqual(['１차', '２ｎｄ', 'ＯＲＤＥＲ　３', 'Ｈ４', '３Ｘ'].map(PO), [1, 2, 3, 4, 3]); });
+test('공백·대소문자·괄호 단위: "  1  ST  " · "(1차)" · "1차 (m/s²)" · "2X [dB]"', () => { assert.deepEqual(['  1  ST  ', '(1차)', '1차 (m/s²)', '2X [dB]', 'ORDER 2'].map(PO), [1, 1, 1, 2, 2]); });
+test('overall 표기: overall · OA · O.A. · 전체 · 합성', () => { ['overall', 'Overall', 'OA', 'O.A.', '전체', '합성'].forEach(t => assert.equal(PO(t), 'overall', t)); });
+test('거부해야 하는 표기 — 추측하지 않고 이유를 돌려줌', () => {
+  // 2st·11st·1th: 서수 접미사가 틀림 / 0차·H0: 0 / 1차2차·차수·RPM·abc: 알 수 없음 / 2023: 숫자만인데 너무 큼 / 1.5st·H1.5·-1·1e3
+  ['2st', '11st', '1th', '0차', 'H0', '1차2차', '차수', 'RPM', 'abc', '', '2023', '1.5st', 'H1.5', '-1', '1e3', '온도(℃)'].forEach(t => {
+    const r = L.parseOrderLabel(t); assert.equal(r.ok, false, t + ' 가 ' + r.order + ' 로 인식됨'); assert.ok(r.reason, t);
+  });
+  assert.match(L.parseOrderLabel('2st').reason, /2nd/);
+});
+test('머리행 가르기: 지점 이름은 파일 그대로, 차수만 정규화', () => {
+  const S = (h, p) => { const r = L.splitMeasHeader(h, p || []); return r.ok ? [r.pointText, r.order] : ['X', r.reason]; };
+  assert.deepEqual(S('P1_1st order'), ['P1', 1]);
+  assert.deepEqual(S('운전석바닥 2X'), ['운전석바닥', 2]);
+  assert.deepEqual(S('Seat Rail (L)_H2'), ['Seat Rail (L)', 2]);
+  assert.deepEqual(S('1차_지점A'), ['지점A', 1]);
+  assert.deepEqual(S('지점1_0.5차'), ['지점1', 0.5]);            // 소수점은 구분자가 아님
+  assert.deepEqual(S('A-B_order 4'), ['A-B', 4]);
+  assert.deepEqual(S('Mic 3_Ord2'), ['Mic 3', 2]);               // 지점 이름 속 숫자·공백 그대로
+  assert.deepEqual(S('예시_운전석바닥_진동_overall'), ['예시_운전석바닥_진동', 'overall']);
+  assert.deepEqual(S('예시_핸들_진동4차', ['예시_핸들_진동']), ['예시_핸들_진동', 4]); // 구분자 없어도 FRF 응답점 이름이 앞에 그대로 있으면
+  assert.equal(S('지점1_2st')[0], 'X'); assert.match(S('지점1_2st')[1], /2nd/);
+  assert.equal(S('온도(℃)')[0], 'X');
+  assert.equal(L.headerOrder('_차수2'), 2); assert.equal(L.headerOrder('overall'), null);
+});
+test('머리행 혼합 예시 파일 = 긴 형식과 같은 값, 「온도(℃)」는 인식 못함으로 표시되고 빠짐', () => {
+  const t = SB.meas.mixed, a = L.analyzeMeasHeaders(t[0], { rpmCol: 0, points: NAMES });
+  assert.equal(a.length, 10);
+  const bad = a.filter(e => e.status !== 'ok');
+  assert.deepEqual(bad.map(e => [e.header, e.status]), [['온도(℃)', 'order']]);
+  assert.deepEqual(a.filter(e => e.status === 'ok').map(e => e.form), ['ordinal', 'ordinal', 'ordinal', 'x', 'x', 'x', 'h', 'order', 'kr']);
+  const cm = L.measMapByHeader(t[0], NAMES, 0);
+  assert.equal(cm.length, 9); sameAsLong(L.parseMeasTable([{ rows: t.slice(1), rpmCol: 0, colMap: cm }]));
+});
+test('FRF 에 없는 지점 이름은 짝이 없음으로 표시(추측 안 함) → 이름 짝(alias)을 주면 씀', () => {
+  const h = ['RPM', '운전석_1차', '운전석_2차'];
+  const a = L.analyzeMeasHeaders(h, { rpmCol: 0, points: NAMES });
+  assert.deepEqual(a.map(e => e.status), ['point', 'point']); assert.equal(a[0].pointText, '운전석');
+  const b = L.analyzeMeasHeaders(h, { rpmCol: 0, points: NAMES, alias: { 운전석: NAMES[0] } });
+  assert.deepEqual(b.map(e => [e.status, e.point, e.order]), [['ok', NAMES[0], 1], ['ok', NAMES[0], 2]]);
+  // 지점별 시트는 시트에 짝지은 응답점으로 고정
+  assert.deepEqual(L.analyzeMeasHeaders(h, { rpmCol: 0, points: NAMES, fixedPoint: NAMES[1] }).map(e => e.point), [NAMES[1], NAMES[1]]);
+});
+test('열별 직접 지정(override): 빼기 · 차수 바꾸기 · 인식 못한 열 살리기 · 차수 목록 밖은 filtered', () => {
+  const h = ['RPM', '1st', 'foo', '2nd', '4th'];
+  const a = L.analyzeMeasHeaders(h, { rpmCol: 0, points: ['P'], defaultPoint: 'P', orders: [1, 2, 3], overrides: { 1: { order: 'skip' }, 2: { order: '3' } } });
+  assert.deepEqual(a.map(e => [e.col, e.status, e.order, e.overridden]), [[1, 'skip', 1, true], [2, 'ok', 3, true], [3, 'ok', 2, false], [4, 'filtered', 4, false]]);
+  assert.equal(L.analyzeMeasHeaders(h, { rpmCol: 0, points: ['P'], defaultPoint: 'P' })[1].status, 'order');
+});
+test('긴 형식의 차수 칸도 같은 규칙: 1 · 2nd · H4 · 1X, 모르는 표기 행은 건너뜀', () => {
+  const rows = [[800, 1, 3], [800, '2nd', 4], [800, 'H4', 5], [1000, '1X', 6], [1000, '2st', 7]];
+  const m = L.parseMeasured(rows, { rpmCol: 0, orderCol: 1, pointCols: { P: 2 } });
+  assert.deepEqual(m.rows.map(r => [r.rpm, r.order, r.values.P]), [[800, 1, 3], [800, 2, 4], [800, 4, 5], [1000, 1, 6]]);
+  assert.equal(m.skipped, 1);
+});
+test('python 머리행 정규화가 웹과 같은 결과 (표기 40개 + 혼합 파일 추정)', () => {
+  try { execFileSync('python3', ['--version']); } catch { return; }
+  const labels = ['1차', '2 차', '3차수', '차수4', '0.5차', '1', '0.5', '200', '1st', '2nd', '3rd', '4th', '11th', '21st', '1st order', '2nd-Order', '1X', '0.5x', 'H1', 'h 2', 'order 1', 'Order_2', 'Ord1', 'ORD.3', '2 order', '１차', '２ｎｄ', 'ＯＲＤＥＲ　３', '(1차)', '1차 (m/s²)', 'OA', '전체', '2st', '11st', '0차', 'H0', '1차2차', 'abc', '2023', '온도(℃)'];
+  const py = JSON.parse(execFileSync('python3', ['-c', 'import sys,json; sys.path.insert(0, sys.argv[1]); import rpm_response as R; print(json.dumps([R.parse_order_label(t)[0] for t in json.loads(sys.argv[2])]))', path.join(ROOT, 'python'), JSON.stringify(labels)], { encoding: 'utf8' }));
+  assert.deepEqual(py, labels.map(PO));
+  const F = Sample.FILE_MEAS_FORMS, run = f => execFileSync('python3', [path.join(ROOT, 'python', 'rpm_response.py'), path.join(ROOT, 'samples', '예시데이터_FRF.csv'), '--point', NAMES.join(','), '--estimate', path.join(ROOT, 'samples', f + '.csv'), '--meas-format', 'wide', '--orders', '1,2,4', '--degree', '1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  assert.equal(run(F.mixed), run(F.pointMajor)); // 머리행만 다르고 값이 같은 두 파일 → 같은 계수
+});
+
 console.log('오차 기준 — 평균(최소제곱) / 최대(minimax) (2026-09-29 오후 확인 4)');
 test('minimax 상수: [0,1,5] → 2.5 (최대 오차 2.5, 최소제곱이면 2)', () => { const s = L.lawson([[1], [1], [1]], [0, 1, 5]); near(s.x[0], 2.5, 1e-9); near(s.maxErr, 2.5, 1e-9); });
 test('minimax 직선: (0,0)(1,1)(2,0) → y = 0.5, 최대 오차 0.5', () => { const s = L.lawson([[1, 0], [1, 1], [1, 2]], [0, 1, 0]); near(s.x[0], 0.5, 1e-9); near(s.x[1], 0, 1e-9); });

@@ -120,6 +120,7 @@ table.grid th, table.grid td { padding: 7px 10px; border-bottom: 1px solid var(-
 table.grid th { background: #eef1f5; text-align: center; position: sticky; top: 0; }
 table.grid td.text, table.grid th.text { text-align: left; white-space: normal; min-width: 10em; }
 table.grid tr.partial td { background: var(--warn-bg); }
+table.grid tr.muted td { color: var(--muted); }
 table.grid td.anti { color: var(--warn-text); font-weight: 700; }
 table.map td, table.map th { text-align: left; white-space: normal; }
 table.map td { min-width: 9em; }

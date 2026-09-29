@@ -81,6 +81,14 @@
         .concat(RPMS.map(function (r) { return [r].concat([].concat.apply([], names.map(function (n, pi) { return ORDERS.map(function (k) { return val(r, k, pi); }); }))); })),
       // 여러 지점, overall 만
       multiOverall: [['RPM'].concat(names.map(function (n) { return n + '_overall'; }))].concat(RPMS.map(function (r) { return [r].concat(names.map(function (n, pi) { return ovl(r, pi); })); })),
+      // 2026-09-29 저녁 — 머리행 표기가 제각각인 파일(지점 우선). 지점 이름은 그대로, 차수는 1st·2nd order·4th / 1X·2x·4X / H1·Ord2·４차(전각).
+      // 「온도(℃)」 열은 차수 표기가 아니어서 인식하지 못함으로 표시되고 계산에 쓰이지 않아야 합니다.
+      mixed: (function () {
+        var labels = [['_1st', '_2nd order', '_4th'], [' 1X', ' 2x', ' 4X'], ['_H1', '_Ord2', '_\uff14차']];
+        var head = ['RPM', '온도(℃)'];
+        names.forEach(function (n, pi) { labels[pi].forEach(function (l) { head.push(n + l); }); });
+        return [head].concat(RPMS.map(function (r) { return [r, 25].concat([].concat.apply([], names.map(function (n, pi) { return ORDERS.map(function (k) { return val(r, k, pi); }); }))); }));
+      })(),
       // 지점별 시트: 시트 이름 = 응답점, 시트마다 RPM, 1차, 2차, …
       sheets: names.map(function (n, pi) { return { name: n, rows: [['RPM'].concat(ORDERS.map(function (k) { return k + '차'; }))].concat(RPMS.map(function (r) { return [r].concat(ORDERS.map(function (k) { return val(r, k, pi); })); })) }; })
     };
@@ -107,7 +115,7 @@
   var api = {
     build: build, FILE_FRF: '예시데이터_FRF', FILE_MEAS: '예시데이터_계측응답', FILE_FORCE: '예시데이터_가진력표',
     // 계측 형식별 예시 파일 (2026-09-29 오후)
-    FILE_MEAS_FORMS: { single: '예시데이터_계측_1지점_차수별', singleOverall: '예시데이터_계측_1지점_overall', orderMajor: '예시데이터_계측_다지점_차수우선', pointMajor: '예시데이터_계측_다지점_지점우선', multiOverall: '예시데이터_계측_다지점_overall', sheets: '예시데이터_계측_지점별시트' }
+    FILE_MEAS_FORMS: { single: '예시데이터_계측_1지점_차수별', singleOverall: '예시데이터_계측_1지점_overall', orderMajor: '예시데이터_계측_다지점_차수우선', pointMajor: '예시데이터_계측_다지점_지점우선', multiOverall: '예시데이터_계측_다지점_overall', mixed: '예시데이터_계측_다지점_머리행혼합', sheets: '예시데이터_계측_지점별시트' }
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.FRFSample = api;

@@ -24,7 +24,7 @@ writeXlsx(Sample.FILE_MEAS, s.measRows);
 fs.writeFileSync(path.join(out, Sample.FILE_FORCE + '.csv'), L.toCsv(s.forceRows));
 // 계측 형식별 예시 (2026-09-29 오후): csv + xlsx, 지점별 시트는 xlsx 하나(+ 시트마다 csv — 파이썬용)
 const F = Sample.FILE_MEAS_FORMS;
-['single', 'singleOverall', 'orderMajor', 'pointMajor', 'multiOverall'].forEach(k => {
+['single', 'singleOverall', 'orderMajor', 'pointMajor', 'multiOverall', 'mixed'].forEach(k => {
   fs.writeFileSync(path.join(out, F[k] + '.csv'), L.toCsv(s.meas[k]));
   writeXlsx(F[k], s.meas[k]);
 });

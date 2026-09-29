@@ -337,6 +337,12 @@
    * 계측 표 읽기(가정 형식: 한 행 = RPM·차수 하나, 응답점마다 열 하나).
    * mapping: {rpmCol, orderCol, pointCols:{응답점이름: 열번호}}
    */
+  /** 긴 형식의 차수 칸: 숫자면 그대로, 글자면 차수 표기 정규화(1차·1st·H1·1X …). overall·모르는 표기는 NaN */
+  function cellOrder(v) {
+    if (typeof v === 'number') return v;
+    var r = parseOrderLabel(v);
+    return r.ok && r.order !== 'overall' ? r.order : NaN;
+  }
   function parseMeasured(rows, mapping) {
     var errs = [];
     if (mapping.rpmCol == null || mapping.rpmCol < 0) errs.push('계측 표의 RPM 열을 지정해 주십시오.');
@@ -346,7 +352,7 @@
     if (errs.length) return { ok: false, errors: errs };
     var out = [], skipped = 0;
     rows.forEach(function (r) {
-      var rpm = toNumber(r[mapping.rpmCol]), k = toNumber(r[mapping.orderCol]);
+      var rpm = toNumber(r[mapping.rpmCol]), k = cellOrder(r[mapping.orderCol]);
       if (isNaN(rpm) || isNaN(k)) { skipped++; return; }
       var values = {};
       names.forEach(function (n) { var v = toNumber(r[mapping.pointCols[n]]); values[n] = isNaN(v) ? null : v; });
@@ -584,14 +590,9 @@
    *   여러 지점   : 차수 우선 RPM, 지점1_1차, 지점2_1차, …, 지점1_2차, …
    *                 지점 우선 RPM, 지점1_1차, 지점1_2차, …, 지점2_1차, …
    *   지점별 시트 : 시트마다 RPM, 1차, 2차, … (또는 RPM, overall)
-   * 배정은 머리행 이름(응답점 이름 + 「n차」·「overall」)으로 자동으로 하거나, 위치(차수 우선/지점 우선)로 합니다.
+   * 배정은 머리행 이름(응답점 이름 + 차수 표기·overall)으로 자동으로 하거나, 위치(차수 우선/지점 우선)로 합니다.
+   * 머리행 규칙(2026-09-29 저녁 확정): 지점 이름은 파일에 있는 그대로, 차수는 1차·2차 … 기본에 1·2 …, 1st·2nd …, 1X, H1, order 1 도 인식.
    */
-  var RE_OVERALL = /overall|전체|합성|(^|[^a-z])o\.?a\.?([^a-z]|$)/i;
-  function headerOrder(t) {
-    var s = String(t);
-    var m = s.match(/(\d+(?:\.\d+)?)\s*(차|order|ord|x(?![a-z]))/i) || s.match(/(?:차수|order)\s*[_\-\s]?(\d+(?:\.\d+)?)/i);
-    return m ? +m[1] : null;
-  }
   /** 위치로 배정. layout 'order' = 차수 우선, 'point' = 지점 우선. orders 에 'overall' 하나를 주면 overall 표 */
   function measLayoutMap(startCol, points, orders, layout) {
     var P = points.length, K = orders.length, out = [];
@@ -602,22 +603,144 @@
     }
     return out;
   }
-  /** 머리행 이름으로 배정. 응답점이 하나면 이름이 없어도 그 응답점으로 봅니다 */
-  function measMapByHeader(headers, points, rpmCol) {
-    var out = [];
-    headers.forEach(function (h, c) {
-      if (c === rpmCol) return;
-      var t = String(h == null ? '' : h).trim();
-      if (!t) return;
-      var pt = null, best = 0;
-      points.forEach(function (p) { if (t.indexOf(p) >= 0 && p.length > best) { pt = p; best = p.length; } });
-      if (!pt && points.length === 1) pt = points[0];
-      if (!pt) return;
-      var rest = t.replace(pt, '');
-      var k = RE_OVERALL.test(rest) ? 'overall' : headerOrder(rest);
-      if (k != null) out.push({ col: c, point: pt, order: k });
+  // ── 차수 표기 정규화 (2026-09-29 저녁 수강생 답변) ─────────────────────
+  /*
+   * 「이름은 파일에 있는 그대로, 차수는 기본 1차·2차 … 이되 1, 2 … 또는 1st, 2nd … 등 알아볼 수 있는 형태면 인식」
+   * 차수 표기 하나(머리행에서 지점 이름을 뗀 나머지)를 차수 숫자로 바꿉니다. 모르는 표기는 추측하지 않고 이유와 함께 돌려줍니다.
+   *   1차 · 1 차 · 1차수 · 차수1 · 차수_1        → 'kr'
+   *   1 · 0.5 (숫자만, 200 이하)                 → 'num'
+   *   1st · 2nd · 3rd · 4th · 11th · 1st order    → 'ordinal' (접미사가 숫자와 맞아야 함: 2st·11st 는 거부)
+   *   1X · 1x · 0.5X                              → 'x'
+   *   H1 · h2                                     → 'h'
+   *   order 1 · Order_2 · Ord1 · ord.3 · 2 order  → 'order'
+   *   overall · OA · O.A. · 전체 · 합성           → overall
+   * 전각 숫자·문자(１차, ２ｎｄ)는 NFKC 로 반각으로, 대소문자·앞뒤·연속 공백은 무시합니다.
+   * 끝에 붙은 괄호 단위(「1차 (m/s²)」·「2X [dB]」)는 떼고 읽습니다.
+   */
+  var ORDER_FORMS = { kr: 'n차', num: '숫자', ordinal: '서수(1st·2nd…)', x: 'nX', h: 'Hn', order: 'order n', overall: 'overall' };
+  var BARE_MAX = 200; // 숫자만 있는 머리행은 이보다 크면 차수로 보지 않음(연도·일련번호 오인 방지)
+  function normLabel(t) {
+    var s = String(t == null ? '' : t);
+    if (s.normalize) s = s.normalize('NFKC');
+    s = s.replace(/[ 　\s]+/g, ' ').trim().toLowerCase();
+    var u;
+    while ((u = s.replace(/\s*(\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\})\s*$/, '')) !== s && u) s = u.trim();
+    var w = s.match(/^[(\[{]\s*(.*?)\s*[)\]}]$/); // 통째로 괄호: (1차)
+    return w ? w[1] : s;
+  }
+  var GENERIC = '차수 표기를 알아보지 못했습니다';
+  function ordinalSuffix(n) { var t = n % 100; if (t >= 11 && t <= 13) return 'th'; return { 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'; }
+  /** 반환 {ok:true, order:숫자|'overall', form} | {ok:false, reason} */
+  function parseOrderLabel(t) {
+    var s = normLabel(t), m;
+    if (!s) return { ok: false, reason: '빈 칸' };
+    if (/^(overall|o\.?\s?a\.?|전체|합성)$/.test(s)) return { ok: true, order: 'overall', form: 'overall' };
+    function num(v, form) {
+      var k = +v;
+      if (!(k > 0) || !isFinite(k)) return { ok: false, reason: '차수는 0보다 커야 합니다' };
+      return { ok: true, order: k, form: form };
+    }
+    if ((m = s.match(/^(\d+(?:\.\d+)?)\s*차(?:수)?$/)) || (m = s.match(/^차수\s*[_\-#:]?\s*(\d+(?:\.\d+)?)$/))) return num(m[1], 'kr');
+    if ((m = s.match(/^(\d+)\s*(st|nd|rd|th)(?:[\s_\-]*(?:order|ord\.?|차))?$/))) {
+      if (ordinalSuffix(+m[1]) !== m[2]) return { ok: false, reason: '서수 접미사가 맞지 않습니다(' + m[1] + ordinalSuffix(+m[1]) + ' 이어야 함)' };
+      return num(m[1], 'ordinal');
+    }
+    if ((m = s.match(/^(\d+(?:\.\d+)?)\s*x$/))) return num(m[1], 'x');
+    if ((m = s.match(/^h\s*[_\-]?\s*(\d+)$/))) return num(m[1], 'h');
+    if ((m = s.match(/^(?:order|ord)\.?\s*[_\-#:]?\s*(\d+(?:\.\d+)?)$/)) || (m = s.match(/^(\d+(?:\.\d+)?)\s*[_\-]?\s*(?:order|ord)\.?$/))) return num(m[1], 'order');
+    if ((m = s.match(/^\d+(?:\.\d+)?$/))) {
+      if (+s > BARE_MAX) return { ok: false, reason: '숫자만 있는 머리행은 ' + BARE_MAX + ' 이하만 차수로 봅니다' };
+      return num(s, 'num');
+    }
+    return { ok: false, reason: GENERIC };
+  }
+  var SEP = '\\s_\\-/|:·＿－／'; // 지점 이름과 차수 사이 구분자. 소수점 「.」은 넣지 않음(0.5차)
+  var RE_SEP = new RegExp('[' + SEP + ']'), RE_EDGE = new RegExp('^[' + SEP + ']+|[' + SEP + ']+$', 'g');
+  /**
+   * 머리행 하나 → {pointText(파일 그대로), label, order, form} | {ok:false, reason}
+   * 지점 이름은 고치지 않고 앞뒤 구분자만 뗍니다. points(FRF 응답점 이름)가 머리행 앞(또는 뒤)에 그대로 있으면 먼저 그 이름으로 가릅니다.
+   * 그 밖에는 구분자에서 잘라 「가장 긴 뒷부분」이 차수 표기가 되는 곳을 찾고(지점_1st order), 안 되면 앞부분(1차_지점)을 봅니다.
+   */
+  function splitMeasHeader(h, points) {
+    var t = String(h == null ? '' : h).trim();
+    if (!t) return { ok: false, pointText: '', reason: '빈 칸' };
+    var whole = t.replace(RE_EDGE, ''), r = parseOrderLabel(whole);
+    if (r.ok) return { ok: true, pointText: '', label: whole, order: r.order, form: r.form };
+    var byLen = (points || []).filter(Boolean).slice().sort(function (a, b) { return b.length - a.length; });
+    for (var i = 0; i < byLen.length; i++) {
+      var p = byLen[i], rest = null;
+      if (t.indexOf(p) === 0) rest = t.slice(p.length);
+      else if (t.length > p.length && t.lastIndexOf(p) === t.length - p.length) rest = t.slice(0, t.length - p.length);
+      if (rest == null) continue;
+      rest = rest.replace(RE_EDGE, '');
+      r = parseOrderLabel(rest);
+      if (r.ok) return { ok: true, pointText: p, label: rest, order: r.order, form: r.form };
+    }
+    var cut = [], why = null;
+    for (var c = 0; c < t.length; c++) if (RE_SEP.test(t[c])) cut.push(c);
+    for (var a = 0; a < cut.length; a++) { // 뒤가 차수: 가장 긴 뒷부분부터
+      var tail = t.slice(cut[a] + 1).replace(RE_EDGE, ''), head = t.slice(0, cut[a]).replace(RE_EDGE, '');
+      if (!tail || !head) continue;
+      r = parseOrderLabel(tail);
+      if (r.ok) return { ok: true, pointText: head, label: tail, order: r.order, form: r.form };
+      if (r.reason !== GENERIC) why = r.reason; // 「2st」처럼 차수 비슷하지만 틀린 표기는 그 이유를 알림
+    }
+    for (var b = cut.length - 1; b >= 0; b--) { // 앞이 차수: 가장 긴 앞부분부터
+      var head2 = t.slice(0, cut[b]).replace(RE_EDGE, ''), tail2 = t.slice(cut[b] + 1).replace(RE_EDGE, '');
+      if (!tail2 || !head2) continue;
+      r = parseOrderLabel(head2);
+      if (r.ok) return { ok: true, pointText: tail2, label: head2, order: r.order, form: r.form };
+    }
+    return { ok: false, pointText: t, reason: why || parseOrderLabel(whole).reason };
+  }
+  /** 머리행에서 차수 숫자만(예전 이름 유지). overall 이나 모르는 표기는 null */
+  function headerOrder(t) {
+    var r = splitMeasHeader(t, []);
+    return r.ok && r.order !== 'overall' ? r.order : null;
+  }
+  function orderText(k) { return k === 'overall' ? 'overall' : k + '차'; }
+  /**
+   * 가로 형식 머리행 전체를 읽어 열마다 인식 결과를 돌려줍니다(화면 「열 배정 확인」 표의 재료).
+   * opts: {rpmCol, points: FRF 응답점 이름, defaultPoint: 지점 이름 없는 열의 응답점, fixedPoint: 모든 열을 이 응답점으로(지점별 시트),
+   *        alias: {파일의 지점 이름: FRF 응답점}, kind: 'order'|'overall', orders: 쓸 차수 목록(없으면 전부),
+   *        overrides: {열번호: {order: ''|'skip'|'overall'|숫자, point: ''|FRF 응답점}}}
+   * 반환 [{col, header, pointText, label, form, order(최종), auto(머리행에서 읽은 차수), point, status, reason, overridden}]
+   *   status: ok(씀) · order(차수 표기 모름) · point(응답점 짝 없음) · filtered(값 종류·차수 목록 밖) · skip(사용자가 뺌)
+   */
+  function analyzeMeasHeaders(headers, opts) {
+    opts = opts || {};
+    var points = opts.points || [], alias = opts.alias || {}, ov = opts.overrides || {}, out = [];
+    (headers || []).forEach(function (h, c) {
+      if (c === opts.rpmCol) return;
+      var raw = String(h == null ? '' : h).trim();
+      if (!raw) return;
+      var s = splitMeasHeader(raw, points), e = { col: c, header: raw, pointText: s.ok ? s.pointText : '', label: s.label || '', form: s.form || '', order: s.ok ? s.order : null, auto: s.ok ? s.order : null, point: null, status: 'ok', reason: '', overridden: false };
+      if (opts.fixedPoint) e.point = opts.fixedPoint;
+      else if (!e.pointText) e.point = opts.defaultPoint || null;
+      else if (alias[e.pointText]) e.point = alias[e.pointText];
+      else if (points.indexOf(e.pointText) >= 0) e.point = e.pointText;
+      var o = ov[c] || ov[String(c)];
+      if (o && o.point) { e.point = o.point; e.overridden = true; }
+      if (o && o.order === 'skip') { e.status = 'skip'; e.overridden = true; out.push(e); return; }
+      if (o && o.order !== '' && o.order != null) {
+        var k = o.order === 'overall' ? 'overall' : toNumber(o.order);
+        if (k === 'overall' || k > 0) { e.order = k; e.overridden = true; }
+      }
+      if (e.order == null) { e.status = 'order'; e.reason = s.reason || '차수 표기를 알아보지 못했습니다'; }
+      else if (!e.point) { e.status = 'point'; e.reason = e.pointText ? '「' + e.pointText + '」와 이름이 같은 FRF 응답점이 없습니다' : '응답점을 골라 주십시오'; }
+      else if (opts.kind === 'overall' && e.order !== 'overall') { e.status = 'filtered'; e.reason = '값 종류가 overall 이라 차수 열은 쓰지 않음'; }
+      else if (opts.kind === 'order' && e.order === 'overall') { e.status = 'filtered'; e.reason = '값 종류가 차수별이라 overall 열은 쓰지 않음'; }
+      else if (opts.orders && e.order !== 'overall' && opts.orders.indexOf(e.order) < 0) { e.status = 'filtered'; e.reason = '차수 목록에 없음'; }
+      out.push(e);
     });
     return out;
+  }
+  /** 머리행 이름으로 배정(인식된 열만). 응답점이 하나면 지점 이름이 없는 열도 그 응답점으로 봅니다 */
+  function measMapByHeader(headers, points, rpmCol, opts) {
+    var o = Object.assign({}, opts || {});
+    o.rpmCol = rpmCol; o.points = points;
+    if (o.defaultPoint === undefined && points.length === 1) o.defaultPoint = points[0];
+    return analyzeMeasHeaders(headers, o).filter(function (e) { return e.status === 'ok'; }).map(function (e) { return { col: e.col, point: e.point, order: e.order }; });
   }
   /**
    * parts: [{rows(머리행 아래), rpmCol, colMap:[{col, point, order}]}] — 지점별 시트는 시트마다 part 하나
@@ -1141,6 +1264,7 @@
     observations: observations, fitStats: fitStats, estimateScaleFixed: estimateScaleFixed, estimatePoly: estimatePoly,
     polyText: polyText, fitToSheets: fitToSheets,
     measLayoutMap: measLayoutMap, measMapByHeader: measMapByHeader, parseMeasTable: parseMeasTable, headerOrder: headerOrder,
+    parseOrderLabel: parseOrderLabel, splitMeasHeader: splitMeasHeader, analyzeMeasHeaders: analyzeMeasHeaders, orderText: orderText, ORDER_FORMS: ORDER_FORMS, cellOrder: cellOrder,
     overallObservations: overallObservations, lawson: lawson, solveLinear: solveLinear, levenberg: levenberg
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

@@ -27,12 +27,18 @@
   ... --estimate 계측.csv --orders 1,2,4 --scales 1,0.5,0.2 --ref-order 1
                                           scale 고정: 기준 차수의 RPM별 크기
   계측 CSV: 열 = RPM, 차수, 응답점 이름… (웹 도구의 예시 계측 표와 같은 형식)
+
+머리행 규칙 (2026-09-29 저녁 확정)
+  지점 이름은 파일에 있는 그대로 FRF 응답점 이름과 맞춥니다(다르면 --alias 파일이름=FRF이름;…).
+  차수: 1차·2차 기본 + 1·2, 1st·2nd·3rd·4th, 1X·1x, H1, order 1·1st order·Ord1, 전각 숫자, 공백·대소문자 무시.
+  알아보지 못한 머리행은 쓰지 않고 표준오류에 이유를 적습니다.
 """
 import argparse
 import csv
 import math
 import re
 import sys
+import unicodedata
 
 
 def read_frf(path, point):
@@ -168,28 +174,146 @@ def _num(v):
         return None
 
 
+# ── 차수 표기 정규화 (2026-09-29 저녁 — 웹 도구 parseOrderLabel·splitMeasHeader 와 같은 규칙) ──
+# 지점 이름은 파일 그대로, 차수는 1차·2차 기본 + 1·2, 1st·2nd, 1X, H1, order 1, Ord1, 전각 숫자, 공백·대소문자 무시.
+# 모르는 표기는 추측하지 않고 이유를 돌려줍니다(웹 화면은 「열 배정 확인」 표에 표시, 여기서는 표준오류로 알림).
+GENERIC = "차수 표기를 알아보지 못했습니다"
+BARE_MAX = 200
+SEP = r"\s_\-/|:·＿－／"
+RE_EDGE = re.compile("^[" + SEP + "]+|[" + SEP + "]+$")
+RE_SEPC = re.compile("[" + SEP + "]")
+
+
+def _norm_label(t):
+    s = unicodedata.normalize("NFKC", "" if t is None else str(t))
+    s = re.sub(r"[\u00a0\u3000\s]+", " ", s).strip().lower()
+    while True:
+        u = re.sub(r"\s*(\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\})\s*$", "", s)
+        if u == s or not u:
+            break
+        s = u.strip()
+    w = re.match(r"^[(\[{]\s*(.*?)\s*[)\]}]$", s)
+    return w.group(1) if w else s
+
+
+def _ordinal_suffix(n):
+    if 11 <= n % 100 <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def parse_order_label(t):
+    """차수 표기 하나 → (차수 | 'overall' | None, 형태 또는 거부 이유)"""
+    s = _norm_label(t)
+    if not s:
+        return None, "빈 칸"
+    if re.match(r"^(overall|o\.?\s?a\.?|전체|합성)$", s):
+        return "overall", "overall"
+
+    def num(v, form):
+        k = float(v)
+        return (k, form) if k > 0 else (None, "차수는 0보다 커야 합니다")
+
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*차(?:수)?$", s) or re.match(r"^차수\s*[_\-#:]?\s*(\d+(?:\.\d+)?)$", s)
+    if m:
+        return num(m.group(1), "kr")
+    m = re.match(r"^(\d+)\s*(st|nd|rd|th)(?:[\s_\-]*(?:order|ord\.?|차))?$", s)
+    if m:
+        if _ordinal_suffix(int(m.group(1))) != m.group(2):
+            return None, "서수 접미사가 맞지 않습니다(%s%s 이어야 함)" % (m.group(1), _ordinal_suffix(int(m.group(1))))
+        return num(m.group(1), "ordinal")
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*x$", s)
+    if m:
+        return num(m.group(1), "x")
+    m = re.match(r"^h\s*[_\-]?\s*(\d+)$", s)
+    if m:
+        return num(m.group(1), "h")
+    m = re.match(r"^(?:order|ord)\.?\s*[_\-#:]?\s*(\d+(?:\.\d+)?)$", s) or re.match(r"^(\d+(?:\.\d+)?)\s*[_\-]?\s*(?:order|ord)\.?$", s)
+    if m:
+        return num(m.group(1), "order")
+    if re.match(r"^\d+(?:\.\d+)?$", s):
+        if float(s) > BARE_MAX:
+            return None, "숫자만 있는 머리행은 %d 이하만 차수로 봅니다" % BARE_MAX
+        return num(s, "num")
+    return None, GENERIC
+
+
+def split_meas_header(h, points=()):
+    """머리행 → (지점 이름(파일 그대로, 없으면 ''), 차수 | 'overall' | None, 이유)"""
+    t = ("" if h is None else str(h)).strip()
+    if not t:
+        return "", None, "빈 칸"
+    whole = RE_EDGE.sub("", t)
+    k, why = parse_order_label(whole)
+    if k is not None:
+        return "", k, why
+    for p in sorted([p for p in points if p], key=len, reverse=True):
+        rest = None
+        if t.startswith(p):
+            rest = t[len(p):]
+        elif len(t) > len(p) and t.endswith(p):
+            rest = t[:len(t) - len(p)]
+        if rest is None:
+            continue
+        k, _ = parse_order_label(RE_EDGE.sub("", rest))
+        if k is not None:
+            return p, k, ""
+    cut = [i for i, ch in enumerate(t) if RE_SEPC.match(ch)]
+    reason = None
+    for c in cut:
+        head, tail = RE_EDGE.sub("", t[:c]), RE_EDGE.sub("", t[c + 1:])
+        if not head or not tail:
+            continue
+        k, r = parse_order_label(tail)
+        if k is not None:
+            return head, k, ""
+        if r != GENERIC:
+            reason = r
+    for c in reversed(cut):
+        head, tail = RE_EDGE.sub("", t[:c]), RE_EDGE.sub("", t[c + 1:])
+        if not head or not tail:
+            continue
+        k, _ = parse_order_label(head)
+        if k is not None:
+            return tail, k, ""
+    return t, None, reason or parse_order_label(whole)[1]
+
+
+def _cell_order(v):
+    """긴 형식의 차수 칸: 1 · 1차 · 1st · H1 · 1X … (overall·모르는 표기는 None)"""
+    k, _ = parse_order_label(v)
+    return None if k == "overall" else k
+
+
 def header_order(t):
-    """머리행에서 차수 읽기: 「1차」「2x」「order 4」「차수2」"""
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(차|order|ord|x(?![a-z]))", t, re.I) or re.search(r"(?:차수|order)\s*[_\-\s]?(\d+(?:\.\d+)?)", t, re.I)
-    return float(m.group(1)) if m else None
+    """머리행에서 차수 숫자만 (overall·모르는 표기는 None)"""
+    _, k, _ = split_meas_header(t)
+    return None if k == "overall" else k
 
 
-RE_OVERALL = re.compile(r"overall|전체|합성|(^|[^a-z])o\.?a\.?([^a-z]|$)", re.I)
-
-
-def meas_map(head, points, orders, layout):
-    """열 배정 [(열, 응답점, 차수|'overall')]. layout: order(차수 우선) / point(지점 우선) / header(머리행 이름)"""
+def meas_map(head, points, orders, layout, alias=None, warn=None, fixed=None):
+    """열 배정 [(열, 응답점, 차수|'overall')]. layout: order(차수 우선) / point(지점 우선) / header(머리행 이름)
+    header: 지점 이름이 FRF 응답점과 같거나 alias 로 짝지은 열만 씀. 응답점이 하나면 지점 이름 없는 열은 그 응답점.
+            fixed 를 주면(지점별 파일) 모든 열이 그 응답점."""
     if layout == "header":
+        alias = alias or {}
         out = []
         for c, h in enumerate(head[1:], start=1):
             h = h.strip()
-            hits = [p for p in points if p in h]
-            pt = max(hits, key=len) if hits else (points[0] if len(points) == 1 else None)
-            if pt is None:
+            if not h:
                 continue
-            rest = h.replace(pt, "", 1)
-            k = "overall" if RE_OVERALL.search(rest) else header_order(rest)
-            if k is not None and (k == "overall" or orders is None or k in orders):
+            pt_text, k, why = split_meas_header(h, points)
+            if fixed:
+                pt = fixed
+            elif pt_text:
+                pt = alias.get(pt_text) or (pt_text if pt_text in points else None)
+            else:
+                pt = points[0] if len(points) == 1 else None
+            if k is None or pt is None:
+                if warn is not None:
+                    warn.append("%s열 「%s」: %s" % (c + 1, h, why if k is None else "지점 이름 「%s」와 같은 응답점이 없습니다(--alias 로 짝지어 주십시오)" % pt_text))
+                continue
+            if k == "overall" or orders is None or k in orders:
                 out.append((c, pt, k))
         return out
     P, K = len(points), len(orders)
@@ -200,21 +324,21 @@ def meas_map(head, points, orders, layout):
     return out
 
 
-def read_measured(path, points, fmt="long", layout="header", orders=None):
+def read_measured(path, points, fmt="long", layout="header", orders=None, alias=None, warn=None, fixed=None):
     """계측 CSV → [(rpm, 차수|'overall', 응답점, |계측|)] — 웹 도구 「계측 표 형식」과 같은 형식들
       long : RPM, 차수, 응답점…          wide : RPM, 값 열들 (layout 으로 배정, 첫 열 = RPM)
       files: path 가 쉼표로 여러 개 — points 순서대로 한 파일 = 한 지점 (RPM, 1차, 2차 …)"""
     out = []
     if fmt == "files":
         for p, one in zip(points, path.split(",")):
-            out += read_measured(one, [p], "wide", layout, orders)
+            out += read_measured(one, [p], "wide", layout, orders, alias, warn, fixed=p)
         return out
     rows = _read_csv(path)
     head = [h.strip() for h in rows[0]]
     if fmt == "long":
         cols = {p: head.index(p) for p in points if p in head}
         for r in rows[1:]:
-            rpm, k = (_num(r[0]), _num(r[1])) if len(r) > 1 else (None, None)
+            rpm, k = (_num(r[0]), _cell_order(r[1])) if len(r) > 1 else (None, None)
             if rpm is None or k is None:
                 continue
             for p, c in cols.items():
@@ -222,11 +346,12 @@ def read_measured(path, points, fmt="long", layout="header", orders=None):
                 if v is not None:
                     out.append((rpm, k, p, abs(v)))
         return out
+    cmap = meas_map(head, points, orders, layout, alias, warn, fixed)
     for r in rows[1:]:
         rpm = _num(r[0]) if r else None
         if rpm is None:
             continue
-        for c, p, k in meas_map(head, points, orders, layout):
+        for c, p, k in cmap:
             v = _num(r[c]) if c < len(r) else None
             if v is not None:
                 out.append((rpm, k, p, abs(v)))
@@ -414,6 +539,7 @@ def main():
     ap.add_argument("--anti-ratio", type=float, default=0.05, help="추정: 반공진 경고 기준 (기본 0.05)")
     ap.add_argument("--meas-format", default="long", choices=["long", "wide", "files"], help="계측 표 형식 (기본 long)")
     ap.add_argument("--layout", default="header", choices=["header", "order", "point"], help="wide: 머리행 이름 / 차수 우선 / 지점 우선")
+    ap.add_argument("--alias", help="머리행 지점 이름 ↔ FRF 응답점 짝, 예: 운전석=예시_운전석바닥_진동;핸들=예시_핸들_진동")
     ap.add_argument("--meas-orders", help="wide·files 의 차수 목록(열 순서대로) 또는 overall")
     ap.add_argument("--objective", default="order", choices=["order", "overall"], help="추정: 차수별 오차 / overall 오차")
     ap.add_argument("--crit", default="mean", choices=["mean", "max"], help="추정: 오차 기준 평균(최소제곱) / 최대(minimax)")
@@ -431,7 +557,11 @@ def main():
         mo = None
         if a.meas_orders:
             mo = ["overall"] if a.meas_orders.strip() == "overall" else [float(x) for x in a.meas_orders.split(",")]
-        meas = read_measured(a.estimate, points, a.meas_format, a.layout, mo)
+        alias = dict(x.split("=", 1) for x in a.alias.split(";") if "=" in x) if a.alias else None
+        warn = []
+        meas = read_measured(a.estimate, points, a.meas_format, a.layout, mo, alias, warn)
+        for x in warn:
+            print("인식하지 못한 머리행 — 쓰지 않음: " + x, file=sys.stderr)
         kw = dict(objective=a.objective, crit=a.crit, rel=a.rel, orders=orders)
         if ratio is not None:
             res = estimate(frfs, meas, a.interp, a.anti_ratio, ratio=ratio, **kw)
