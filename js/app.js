@@ -823,7 +823,7 @@
     if (!bad.length) return el('p', { class: 'note', id: 'measHeaderSummary' }, '머리행 ' + an.length + '개 가운데 ' + ok + '개를 계산에 씁니다. 계산 전에 아래 표에서 읽은 차수·응답점을 확인해 주십시오.');
     return el('div', { class: 'alert warn', id: 'measHeaderSummary' }, '머리행 ' + an.length + '개 가운데 ' + bad.length + '개를 알아보지 못해 계산에 쓰지 않습니다(추측하지 않음): ',
       bad.map(function (e) { return '「' + e.header + '」'; }).join(', '),
-      '. 써야 하는 열이면 표의 차수·응답점을 직접 골라 주십시오. 인식하는 차수 표기: 1차 · 1 · 1st · 1X · H1 · order 1 · Ord1 (전각·대소문자 무관).');
+      '. 써야 하는 열이면 표의 차수·응답점을 직접 골라 주십시오. 인식하는 차수 표기: 1차 · 1 · 1st · 1X · H1 · order 1 · 1ord · ord1 (전각·대소문자 무관). 1/rev 는 쓰지 않는 것으로 확인해 읽지 않습니다.');
   }
   /** 직접 지정 차수 목록: 차수 목록 + 머리행에서 읽은 차수 (+ overall) */
   function orderOptions(w, an) {
@@ -860,7 +860,7 @@
     var kindRow = radioGroup('measKind', '값 종류', [['order', '차수별 응답'], ['overall', 'overall 만 (차수 정의 없음)']], w.kind, function (v) { w.kind = v; reset(); render(); });
     var ordIn = el('input', { name: 'measOrders', value: w.ordersText || '', placeholder: '예: 1, 2, 4', oninput: function () { w.ordersText = this.value; reset(); }, onchange: function () { render(); } });
     var layoutOpts = mm.format === 'wide'
-      ? [['auto', '머리행 이름으로 자동 (지점이름_1차 · _1st · _1X · _H1 · _order 1)'], ['order', '차수 우선 (지점1_차수1, 지점2_차수1, …)'], ['point', '지점 우선 (지점1_차수1, 지점1_차수2, …)']]
+      ? [['auto', '머리행 이름으로 자동 (지점이름_1차 · _1st · _1X · _H1 · _order 1 · _1ord · _ord1)'], ['order', '차수 우선 (지점1_차수1, 지점2_차수1, …)'], ['point', '지점 우선 (지점1_차수1, 지점1_차수2, …)']]
       : [['auto', '머리행 이름으로 자동 (1차 · 1 · 1st · 1X · H1 · overall)'], ['pos', '위치로 (시작 열부터 차수 순서)']];
     var layoutRow = radioGroup('measLayout', '열 배치', layoutOpts, w.layout, function (v) { w.layout = v; reset(); render(); });
     var grid = el('div', { class: 'form-grid', style: 'margin-top:12px' });
@@ -1134,7 +1134,7 @@
           el('li', null, '(b) 는 RPM 을 최댓값으로 나눠 풀고 계수를 되돌립니다. 정규방정식(AᵀA)을 직접 풀면 3차 이상에서 오차가 커지기 쉬워 QR 분해를 씁니다.'),
           el('li', null, '검증: 알려진 가진력으로 만든 합성 계측(노이즈 없음)에서 추정값이 원래 값과 1e-9 이내로 같고, ±2% 노이즈에서 3% 이내임을 테스트로 확인합니다.')),
         el('h2', null, '계측 표 형식·overall 오차·오차 기준 (2026-09-29 오후 추가)'),
-        el('div', { class: 'formula' }, '계측 표 형식\n  차수별       RPM, 1차, 2차, …                     (한 지점)\n  overall      RPM, overall                          (차수 정의 없음)\n  여러 지점    차수 우선 RPM, 지점1_1차, 지점2_1차, …, 지점1_2차, …\n               지점 우선 RPM, 지점1_1차, 지점1_2차, …, 지점2_1차, …\n  지점별 시트  시트마다 RPM, 1차, 2차, … (또는 RPM, overall)\n  긴 형식      RPM, 차수, 응답점1, 응답점2, …\n\n머리행 규칙 (2026-09-29 저녁 확정)\n  지점 이름    파일에 있는 그대로 (FRF 응답점 이름과 같으면 짝, 다르면 「지점 이름 짝」에서 고름)\n  차수 표기    1차 · 차수1 (기본)  1 · 0.5 (숫자만, 200 이하)  1st · 2nd · 3rd · 4th · 1st order\n               1X · 1x  H1  order 1 · Ord1 · 2 order   전각 숫자(１차)·대소문자·공백 무관\n  overall      overall · OA · 전체 · 합성\n  모르는 표기  추측하지 않고 「인식 못함」으로 표시, 계산에서 뺌 (2st·11st 처럼 서수가 틀려도)\n\noverall 오차  계산 overall_p(RPM) = √( Σ_k ( |H_p(k·RPM/60)| × F_k(RPM) )² )\n  scale 고정  = F_기준 × √Σ_k(|H_pk| × s_k/s_기준)²  → F_기준 에 선형\n  다항식      F_k 계수에 비선형 → Levenberg–Marquardt\n  (F_k 의 부호는 overall 로 구분되지 않아 양수로 맞춤)\n\n오차 기준     평균값: min Σ e_i² / n   (최소제곱)\n              최대값: min max_i |e_i|  (minimax — Lawson 반복 재가중)\n              e_i = 계산_i − 계측_i  (상대오차면 ÷ 계측_i), i = 모든 계측 지점·RPM(·차수)'),
+        el('div', { class: 'formula' }, '계측 표 형식\n  차수별       RPM, 1차, 2차, …                     (한 지점)\n  overall      RPM, overall                          (차수 정의 없음)\n  여러 지점    차수 우선 RPM, 지점1_1차, 지점2_1차, …, 지점1_2차, …\n               지점 우선 RPM, 지점1_1차, 지점1_2차, …, 지점2_1차, …\n  지점별 시트  시트마다 RPM, 1차, 2차, … (또는 RPM, overall)\n  긴 형식      RPM, 차수, 응답점1, 응답점2, …\n\n머리행 규칙 (2026-09-29 저녁 확정)\n  지점 이름    파일에 있는 그대로 (FRF 응답점 이름과 같으면 짝, 다르면 「지점 이름 짝」에서 고름)\n  차수 표기    1차 · 차수1 (기본)  1 · 0.5 (숫자만, 200 이하)  1st · 2nd · 3rd · 4th · 1st order\n               1X · 1x  H1  order 1 · Ord1 · 2 order · 1ord · ord1 (09-30 확인)\n               전각 숫자(１차)·대소문자·공백 무관\n  쓰지 않음    1/rev (09-30 확인 — 차수로 읽지 않고 「인식 못함」)\n  overall      overall · OA · 전체 · 합성\n  모르는 표기  추측하지 않고 「인식 못함」으로 표시, 계산에서 뺌 (2st·11st 처럼 서수가 틀려도)\n\noverall 오차  계산 overall_p(RPM) = √( Σ_k ( |H_p(k·RPM/60)| × F_k(RPM) )² )\n  scale 고정  = F_기준 × √Σ_k(|H_pk| × s_k/s_기준)²  → F_기준 에 선형\n  다항식      F_k 계수에 비선형 → Levenberg–Marquardt\n  (F_k 의 부호는 overall 로 구분되지 않아 양수로 맞춤)\n\n오차 기준     평균값: min Σ e_i² / n   (최소제곱)\n              최대값: min max_i |e_i|  (minimax — Lawson 반복 재가중)\n              e_i = 계산_i − 계측_i  (상대오차면 ÷ 계측_i), i = 모든 계측 지점·RPM(·차수)'),
         el('ul', null,
           el('li', null, '계측 지점이 하나여도 여럿이어도 같은 식입니다. 여럿이면 모든 지점의 오차를 한데 모아 평균 또는 최대를 줄입니다.'),
           el('li', null, 'overall 만으로도 차수별 가진력을 나눌 수 있는 것은 차수마다 가진 주파수가 달라 |FRF| 가 RPM 에 따라 다르게 변하기 때문입니다. 관측(지점 × RPM)이 계수 수(차수 × (n+1))보다 많아야 하고, 테스트에서 노이즈 없는 합성 overall 로 계수를 1e-7 이내로 복원함을 확인했습니다.'),

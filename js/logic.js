@@ -613,11 +613,13 @@
    *   1X · 1x · 0.5X                              → 'x'
    *   H1 · h2                                     → 'h'
    *   order 1 · Order_2 · Ord1 · ord.3 · 2 order  → 'order'
+   *   1ord · 2ORD · 1 ord · ord1 · ORD 2 · ord_3  → 'order' (2026-09-30 수강생 답변: 1ord·ord1 사용)
+   *   1/rev · 2 / rev · 1 per rev                 → 거부 (2026-09-30: 1/rev 는 쓰지 않음 — 추측하지 않음)
    *   overall · OA · O.A. · 전체 · 합성           → overall
    * 전각 숫자·문자(１차, ２ｎｄ)는 NFKC 로 반각으로, 대소문자·앞뒤·연속 공백은 무시합니다.
    * 끝에 붙은 괄호 단위(「1차 (m/s²)」·「2X [dB]」)는 떼고 읽습니다.
    */
-  var ORDER_FORMS = { kr: 'n차', num: '숫자', ordinal: '서수(1st·2nd…)', x: 'nX', h: 'Hn', order: 'order n', overall: 'overall' };
+  var ORDER_FORMS = { kr: 'n차', num: '숫자', ordinal: '서수(1st·2nd…)', x: 'nX', h: 'Hn', order: 'order n · 1ord · ord1', overall: 'overall' };
   var BARE_MAX = 200; // 숫자만 있는 머리행은 이보다 크면 차수로 보지 않음(연도·일련번호 오인 방지)
   function normLabel(t) {
     var s = String(t == null ? '' : t);
@@ -629,6 +631,11 @@
     return w ? w[1] : s;
   }
   var GENERIC = '차수 표기를 알아보지 못했습니다';
+  // 「1/rev」(회전당 n회) 표기는 쓰지 않는다고 확인됨(2026-09-30 수강생 답변) — 차수로 읽지 않고 이유를 알림.
+  // 머리행에서는 「/」가 구분자라 따로 막지 않으면 「1/rev」가 「1」(차수) + 「rev」(지점)로 잘못 갈라집니다.
+  var RE_PER_REV = /^\d+(?:\.\d+)?\s*(?:\/|per)\s*rev(?:olutions?|s)?\.?$/;
+  var RE_PER_REV_IN = /\d\s*(?:\/|per)\s*rev(?:olutions?|s)?(?![a-z])/; // 「R」(오른쪽 채널)처럼 rev 가 아닌 것은 막지 않음
+  var REV_REASON = '「n/rev」 표기는 쓰지 않는 것으로 확인했습니다(2026-09-30) — 1ord · ord1 · 1차 처럼 적거나 표에서 차수를 직접 골라 주십시오';
   function ordinalSuffix(n) { var t = n % 100; if (t >= 11 && t <= 13) return 'th'; return { 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'; }
   /** 반환 {ok:true, order:숫자|'overall', form} | {ok:false, reason} */
   function parseOrderLabel(t) {
@@ -645,6 +652,7 @@
       if (ordinalSuffix(+m[1]) !== m[2]) return { ok: false, reason: '서수 접미사가 맞지 않습니다(' + m[1] + ordinalSuffix(+m[1]) + ' 이어야 함)' };
       return num(m[1], 'ordinal');
     }
+    if (RE_PER_REV.test(s)) return { ok: false, reason: REV_REASON };
     if ((m = s.match(/^(\d+(?:\.\d+)?)\s*x$/))) return num(m[1], 'x');
     if ((m = s.match(/^h\s*[_\-]?\s*(\d+)$/))) return num(m[1], 'h');
     if ((m = s.match(/^(?:order|ord)\.?\s*[_\-#:]?\s*(\d+(?:\.\d+)?)$/)) || (m = s.match(/^(\d+(?:\.\d+)?)\s*[_\-]?\s*(?:order|ord)\.?$/))) return num(m[1], 'order');
@@ -664,6 +672,7 @@
   function splitMeasHeader(h, points) {
     var t = String(h == null ? '' : h).trim();
     if (!t) return { ok: false, pointText: '', reason: '빈 칸' };
+    if (RE_PER_REV_IN.test(normLabel(t))) return { ok: false, pointText: t, reason: REV_REASON }; // 「지점_1/rev」·「1/rev_지점」
     var whole = t.replace(RE_EDGE, ''), r = parseOrderLabel(whole);
     if (r.ok) return { ok: true, pointText: '', label: whole, order: r.order, form: r.form };
     var byLen = (points || []).filter(Boolean).slice().sort(function (a, b) { return b.length - a.length; });

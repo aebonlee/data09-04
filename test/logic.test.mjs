@@ -415,6 +415,32 @@ test('머리행 가르기: 지점 이름은 파일 그대로, 차수만 정규�
   assert.equal(S('온도(℃)')[0], 'X');
   assert.equal(L.headerOrder('_차수2'), 2); assert.equal(L.headerOrder('overall'), null);
 });
+console.log('차수 표기 1ord · ord1 사용, 1/rev 미사용 (2026-09-30 수강생 답변)');
+test('1ord · 2ord · ord1 — 대소문자·공백·구분자 변형 모두 order 형태', () => {
+  const ok = { '1ord': 1, '2ord': 2, '1ORD': 1, '2Ord': 2, '1 ord': 1, '2 ORD': 2, '1_ord': 1, '1-ord': 1, '1ord.': 1, 'ord1': 1, 'ORD1': 1, 'Ord2': 2, 'ord 1': 1, 'ORD 2': 2, 'ord_3': 3, 'ord-4': 4, 'ord.2': 2, 'ord0.5': 0.5, '0.5ord': 0.5, '１ｏｒｄ': 1, 'ｏｒｄ２': 2 };
+  Object.entries(ok).forEach(([t, k]) => { const r = L.parseOrderLabel(t); assert.equal(r.ok, true, t); assert.equal(r.order, k, t); assert.equal(r.form, 'order', t); });
+});
+test('머리행: 지점_1ord · 지점_ord1 · 1ord_지점 → 지점 이름 그대로 + 차수', () => {
+  const S = h => { const r = L.splitMeasHeader(h, []); return r.ok ? [r.pointText, r.order] : ['X', r.reason]; };
+  assert.deepEqual(S('운전석바닥_1ord'), ['운전석바닥', 1]);
+  assert.deepEqual(S('운전석바닥_ORD2'), ['운전석바닥', 2]);
+  assert.deepEqual(S('Seat Rail (L) 2ord'), ['Seat Rail (L)', 2]);
+  assert.deepEqual(S('1ord_핸들'), ['핸들', 1]);
+  const a = L.analyzeMeasHeaders(['RPM', 'P1_1ord', 'P1_ord2', 'P1_4ORD'], { rpmCol: 0, points: ['P1'] });
+  assert.deepEqual(a.map(e => [e.status, e.point, e.order]), [['ok', 'P1', 1], ['ok', 'P1', 2], ['ok', 'P1', 4]]);
+});
+test('반드시 거부: 1/rev 는 쓰지 않음 — 표기 하나로도, 머리행 속에서도 차수로 읽지 않음', () => {
+  ['1/rev', '2/REV', '1 / rev', '0.5/rev', '1/Rev.', '1 per rev', '2/revs', '1/revolution', '１／ｒｅｖ'].forEach(t => {
+    const r = L.parseOrderLabel(t); assert.equal(r.ok, false, t + ' 가 ' + r.order + ' 로 인식됨'); assert.match(r.reason, /n\/rev/, t);
+  });
+  // 「/」는 머리행 구분자 — 막지 않으면 「1/rev」가 차수 1 + 지점 「rev」로 조용히 갈라진다(09-29 판의 실제 동작)
+  ['1/rev', '1/rev_운전석', '운전석_1/rev', '운전석 2/REV', 'P1_1 per rev'].forEach(h => {
+    const r = L.splitMeasHeader(h, ['운전석', 'P1']); assert.equal(r.ok, false, h + ' → ' + r.pointText + ' · ' + r.order); assert.match(r.reason, /n\/rev/, h);
+  });
+  assert.equal(L.analyzeMeasHeaders(['RPM', '운전석_1/rev'], { rpmCol: 0, points: ['운전석'] })[0].status, 'order');
+  // rev 가 아닌 「/R」(오른쪽 채널 등)은 이 규칙으로 막지 않음
+  assert.deepEqual((r => [r.ok, r.pointText, r.order])(L.splitMeasHeader('Mic/R_1ord', [])), [true, 'Mic/R', 1]);
+});
 test('머리행 혼합 예시 파일 = 긴 형식과 같은 값, 「온도(℃)」는 인식 못함으로 표시되고 빠짐', () => {
   const t = SB.meas.mixed, a = L.analyzeMeasHeaders(t[0], { rpmCol: 0, points: NAMES });
   assert.equal(a.length, 10);
@@ -445,13 +471,22 @@ test('긴 형식의 차수 칸도 같은 규칙: 1 · 2nd · H4 · 1X, 모르는
   assert.deepEqual(m.rows.map(r => [r.rpm, r.order, r.values.P]), [[800, 1, 3], [800, 2, 4], [800, 4, 5], [1000, 1, 6]]);
   assert.equal(m.skipped, 1);
 });
-test('python 머리행 정규화가 웹과 같은 결과 (표기 40개 + 혼합 파일 추정)', () => {
+test('python 머리행 정규화가 웹과 같은 결과 (표기 49개 + 혼합 파일 추정)', () => {
   try { execFileSync('python3', ['--version']); } catch { return; }
-  const labels = ['1차', '2 차', '3차수', '차수4', '0.5차', '1', '0.5', '200', '1st', '2nd', '3rd', '4th', '11th', '21st', '1st order', '2nd-Order', '1X', '0.5x', 'H1', 'h 2', 'order 1', 'Order_2', 'Ord1', 'ORD.3', '2 order', '１차', '２ｎｄ', 'ＯＲＤＥＲ　３', '(1차)', '1차 (m/s²)', 'OA', '전체', '2st', '11st', '0차', 'H0', '1차2차', 'abc', '2023', '온도(℃)'];
+  const labels = ['1차', '2 차', '3차수', '차수4', '0.5차', '1', '0.5', '200', '1st', '2nd', '3rd', '4th', '11th', '21st', '1st order', '2nd-Order', '1X', '0.5x', 'H1', 'h 2', 'order 1', 'Order_2', 'Ord1', 'ORD.3', '2 order', '１차', '２ｎｄ', 'ＯＲＤＥＲ　３', '(1차)', '1차 (m/s²)', 'OA', '전체', '2st', '11st', '0차', 'H0', '1차2차', 'abc', '2023', '온도(℃)', '1ord', '2ORD', '1 ord', 'ord1', 'Ord 2', 'ord_3', '1/rev', '2 / REV', '1 per rev'];
   const py = JSON.parse(execFileSync('python3', ['-c', 'import sys,json; sys.path.insert(0, sys.argv[1]); import rpm_response as R; print(json.dumps([R.parse_order_label(t)[0] for t in json.loads(sys.argv[2])]))', path.join(ROOT, 'python'), JSON.stringify(labels)], { encoding: 'utf8' }));
   assert.deepEqual(py, labels.map(PO));
   const F = Sample.FILE_MEAS_FORMS, run = f => execFileSync('python3', [path.join(ROOT, 'python', 'rpm_response.py'), path.join(ROOT, 'samples', '예시데이터_FRF.csv'), '--point', NAMES.join(','), '--estimate', path.join(ROOT, 'samples', f + '.csv'), '--meas-format', 'wide', '--orders', '1,2,4', '--degree', '1'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   assert.equal(run(F.mixed), run(F.pointMajor)); // 머리행만 다르고 값이 같은 두 파일 → 같은 계수
+});
+
+test('python·코랩 노트북: 1ord·ord1 인식, 1/rev 거부가 웹과 같음 (머리행 포함)', () => {
+  try { execFileSync('python3', ['--version']); } catch { return; }
+  const hs = ['운전석_1ord', 'P1_ORD2', '1ord_핸들', '1/rev', '운전석_1/rev', '1/rev_운전석', 'Mic/R_1ord'];
+  const web = hs.map(h => { const r = L.splitMeasHeader(h, []); return r.ok ? [r.pointText, r.order] : null; });
+  const code = 'import sys,json\nsys.path.insert(0, sys.argv[1])\nimport rpm_response as R\nnb = json.load(open(sys.argv[3], encoding="utf8"))\nsrc = "".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code" and "def parse_order_label" in "".join(c["source"]))\nns = {}\ntry:\n    exec(src, ns)\nexcept NameError:\n    pass\nhs = json.loads(sys.argv[2])\nf = lambda sp: [None if k is None else [p, k] for p, k, _ in (sp(h) for h in hs)]\nprint(json.dumps([f(R.split_meas_header), f(ns["split_meas_header"])]))';
+  const [py, nb] = JSON.parse(execFileSync('python3', ['-c', code, path.join(ROOT, 'python'), JSON.stringify(hs), path.join(ROOT, 'python', 'rpm_response_colab.ipynb')], { encoding: 'utf8' }));
+  assert.deepEqual(py, web); assert.deepEqual(nb, web);
 });
 
 console.log('오차 기준 — 평균(최소제곱) / 최대(minimax) (2026-09-29 오후 확인 4)');

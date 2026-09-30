@@ -30,7 +30,7 @@
 
 머리행 규칙 (2026-09-29 저녁 확정)
   지점 이름은 파일에 있는 그대로 FRF 응답점 이름과 맞춥니다(다르면 --alias 파일이름=FRF이름;…).
-  차수: 1차·2차 기본 + 1·2, 1st·2nd·3rd·4th, 1X·1x, H1, order 1·1st order·Ord1, 전각 숫자, 공백·대소문자 무시.
+  차수: 1차·2차 기본 + 1·2, 1st·2nd·3rd·4th, 1X·1x, H1, order 1·1st order·Ord1·1ord·ord1(1/rev 는 쓰지 않음 — 거부), 전각 숫자, 공백·대소문자 무시.
   알아보지 못한 머리행은 쓰지 않고 표준오류에 이유를 적습니다.
 """
 import argparse
@@ -175,9 +175,14 @@ def _num(v):
 
 
 # ── 차수 표기 정규화 (2026-09-29 저녁 — 웹 도구 parseOrderLabel·splitMeasHeader 와 같은 규칙) ──
-# 지점 이름은 파일 그대로, 차수는 1차·2차 기본 + 1·2, 1st·2nd, 1X, H1, order 1, Ord1, 전각 숫자, 공백·대소문자 무시.
+# 지점 이름은 파일 그대로, 차수는 1차·2차 기본 + 1·2, 1st·2nd, 1X, H1, order 1, Ord1, 1ord, ord1, 전각 숫자, 공백·대소문자 무시.
 # 모르는 표기는 추측하지 않고 이유를 돌려줍니다(웹 화면은 「열 배정 확인」 표에 표시, 여기서는 표준오류로 알림).
 GENERIC = "차수 표기를 알아보지 못했습니다"
+# 「1/rev」 표기는 쓰지 않는다고 확인됨(2026-09-30 수강생 답변) — 차수로 읽지 않고 이유를 알림(웹과 같은 규칙).
+# 머리행에서는 「/」가 구분자라 따로 막지 않으면 「1/rev」가 「1」(차수) + 「rev」(지점)로 잘못 갈라진다.
+RE_PER_REV = re.compile(r"^\d+(?:\.\d+)?\s*(?:/|per)\s*rev(?:olutions?|s)?\.?$")
+RE_PER_REV_IN = re.compile(r"\d\s*(?:/|per)\s*rev(?:olutions?|s)?(?![a-z])")
+REV_REASON = "「n/rev」 표기는 쓰지 않는 것으로 확인했습니다(2026-09-30) — 1ord · ord1 · 1차 처럼 적거나 표에서 차수를 직접 골라 주십시오"
 BARE_MAX = 200
 SEP = r"\s_\-/|:·＿－／"
 RE_EDGE = re.compile("^[" + SEP + "]+|[" + SEP + "]+$")
@@ -222,6 +227,8 @@ def parse_order_label(t):
         if _ordinal_suffix(int(m.group(1))) != m.group(2):
             return None, "서수 접미사가 맞지 않습니다(%s%s 이어야 함)" % (m.group(1), _ordinal_suffix(int(m.group(1))))
         return num(m.group(1), "ordinal")
+    if RE_PER_REV.match(s):
+        return None, REV_REASON
     m = re.match(r"^(\d+(?:\.\d+)?)\s*x$", s)
     if m:
         return num(m.group(1), "x")
@@ -243,6 +250,8 @@ def split_meas_header(h, points=()):
     t = ("" if h is None else str(h)).strip()
     if not t:
         return "", None, "빈 칸"
+    if RE_PER_REV_IN.search(_norm_label(t)):  # 「지점_1/rev」·「1/rev_지점」
+        return t, None, REV_REASON
     whole = RE_EDGE.sub("", t)
     k, why = parse_order_label(whole)
     if k is not None:
